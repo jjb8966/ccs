@@ -2,7 +2,12 @@ import type { CursorTool } from './cursor-protobuf-schema';
 
 export interface CursorOpenAIMessage {
   role: string;
-  content: string;
+  content:
+    | string
+    | Array<
+        | { type: 'text'; text?: string }
+        | { type: 'image_url'; image_url?: { url?: string; detail?: string } }
+      >;
   name?: string;
   tool_call_id?: string;
   tool_calls?: Array<{
@@ -30,10 +35,21 @@ export interface AnthropicToolResultBlock {
   content?: unknown;
 }
 
+export interface AnthropicImageBlock {
+  type: 'image';
+  source?: {
+    type?: string;
+    media_type?: string;
+    data?: string;
+    url?: string;
+  };
+}
+
 export type AnthropicContentBlock =
   | AnthropicTextBlock
   | AnthropicToolUseBlock
-  | AnthropicToolResultBlock;
+  | AnthropicToolResultBlock
+  | AnthropicImageBlock;
 
 export interface CursorAnthropicRequest {
   model?: string;

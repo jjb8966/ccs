@@ -4,6 +4,7 @@
  */
 
 import type { CursorMessage, CursorTool } from './cursor-protobuf-schema.js';
+import { extractImagesFromOpenAIContent } from './cursor-image-utils.js';
 
 interface OpenAITextPart {
   type: 'text';
@@ -23,6 +24,14 @@ interface OpenAIToolResultPart {
   content?: unknown;
 }
 
+interface OpenAIImageUrlPart {
+  type: 'image_url';
+  image_url?: {
+    url?: string;
+    detail?: string;
+  };
+}
+
 interface OpenAIUnknownPart {
   type: string;
   [key: string]: unknown;
@@ -30,6 +39,7 @@ interface OpenAIUnknownPart {
 
 type OpenAIContentPart =
   | OpenAITextPart
+  | OpenAIImageUrlPart
   | OpenAIToolUsePart
   | OpenAIToolResultPart
   | OpenAIUnknownPart;
@@ -56,6 +66,10 @@ const MAX_TOOL_RESULT_CHARS = 12_000;
 const TOOL_RESULT_SERIALIZATION_FALLBACK = '[unserializable content]';
 const TOOL_USE_ARGUMENTS_FALLBACK = '{}';
 const TOOL_CALL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+function isImageUrlPart(part: OpenAIContentPart): part is OpenAIImageUrlPart {
+  return part.type === 'image_url';
+}
 
 function isTextPart(part: OpenAIContentPart): part is OpenAITextPart {
   return part.type === 'text';
@@ -315,6 +329,10 @@ function renderUserContent(
       continue;
     }
 
+    if (isImageUrlPart(part)) {
+      continue;
+    }
+
     if (!isToolResultPart(part)) {
       continue;
     }
@@ -405,10 +423,12 @@ function convertMessages(messages: OpenAIMessage[]): CursorMessage[] {
         }
       } else {
         const content = renderUserContent(msg.content, toolCallMetaMap, messageIndex);
-        if (content) {
+        const images = extractImagesFromOpenAIContent(msg.content);
+        if (content || images.length > 0) {
           result.push({
             role: 'user',
             content,
+            ...(images.length > 0 ? { images } : {}),
           });
         }
       }

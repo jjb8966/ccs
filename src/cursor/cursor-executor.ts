@@ -10,6 +10,7 @@ import {
   wrapConnectRPCFrame,
 } from './cursor-protobuf.js';
 import { buildCursorRequest } from './cursor-translator.js';
+import { resolveRemoteImageUrlsInBody } from './cursor-image-utils.js';
 import {
   isEndStreamConnectFrame,
   type CursorTool,
@@ -74,7 +75,13 @@ interface ExecutorParams {
   body: {
     messages: Array<{
       role: string;
-      content: string | Array<{ type: string; text?: string }>;
+      content:
+        | string
+        | Array<{
+            type: string;
+            text?: string;
+            image_url?: { url?: string; detail?: string };
+          }>;
       name?: string;
       tool_call_id?: string;
       tool_calls?: Array<{
@@ -214,6 +221,13 @@ export class CursorExecutor {
     return wrapConnectRPCFrame(generateCursorBody(messages, model, tools, reasoningEffort), false);
   }
 
+  private async prepareRequestBody(
+    body: ExecutorParams['body'],
+    signal?: AbortSignal
+  ): Promise<ExecutorParams['body']> {
+    return resolveRemoteImageUrlsInBody(body, signal);
+  }
+
   async makeFetchRequest(
     url: string,
     headers: Record<string, string>,
@@ -317,7 +331,8 @@ export class CursorExecutor {
     const { model, body, stream, credentials, signal } = params;
     const url = this.buildUrl();
     const headers = this.buildHeaders(credentials);
-    const transformedBody = this.transformRequest(model, body, stream, credentials);
+    const resolvedBody = await this.prepareRequestBody(body, signal);
+    const protobufBody = this.transformRequest(model, resolvedBody, stream, credentials);
 
     const startedAt = Date.now();
     logger.stage('upstream', 'cursor.upstream.request', 'Sending Cursor upstream request', {
@@ -332,7 +347,7 @@ export class CursorExecutor {
         const response = await this.executeStreaming(
           url,
           headers,
-          transformedBody,
+          protobufBody,
           model,
           body,
           signal
@@ -343,8 +358,8 @@ export class CursorExecutor {
       // Non-streaming: buffer entire response then transform to JSON
       const http2 = await getHttp2();
       const response = http2
-        ? await this.makeHttp2Request(url, headers, transformedBody, signal)
-        : await this.makeFetchRequest(url, headers, transformedBody, signal);
+        ? await this.makeHttp2Request(url, headers, protobufBody, signal)
+        : await this.makeFetchRequest(url, headers, protobufBody, signal);
 
       if (response.status !== 200) {
         const errorText = response.body?.toString() || 'Unknown error';

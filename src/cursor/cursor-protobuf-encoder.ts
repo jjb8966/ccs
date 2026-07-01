@@ -13,6 +13,7 @@ import {
   type RoleType,
   type CursorTool,
   type CursorToolResult,
+  type CursorMessageImage,
 } from './cursor-protobuf-schema.js';
 
 /**
@@ -92,6 +93,34 @@ export function encodeToolResult(toolResult: CursorToolResult): Uint8Array {
 }
 
 /**
+ * Encode ImageProto.Dimension
+ */
+export function encodeImageDimension(width: number, height: number): Uint8Array {
+  return concatArrays(
+    encodeField(FIELD.ImageDimension.WIDTH, WIRE_TYPE.VARINT, width),
+    encodeField(FIELD.ImageDimension.HEIGHT, WIRE_TYPE.VARINT, height)
+  );
+}
+
+/**
+ * Encode ConversationMessage.ImageProto
+ */
+export function encodeImage(image: CursorMessageImage): Uint8Array {
+  return concatArrays(
+    encodeField(FIELD.Image.DATA, WIRE_TYPE.LEN, image.data),
+    ...(image.width !== undefined && image.height !== undefined
+      ? [
+          encodeField(
+            FIELD.Image.DIMENSION,
+            WIRE_TYPE.LEN,
+            encodeImageDimension(image.width, image.height)
+          ),
+        ]
+      : [])
+  );
+}
+
+/**
  * Encode a conversation message
  */
 export function encodeMessage(
@@ -99,11 +128,15 @@ export function encodeMessage(
   role: RoleType,
   messageId: string,
   chatModeEnum?: number,
-  toolResults: CursorToolResult[] = []
+  toolResults: CursorToolResult[] = [],
+  images: CursorMessageImage[] = []
 ): Uint8Array {
   return concatArrays(
     encodeField(FIELD.Message.CONTENT, WIRE_TYPE.LEN, content),
     encodeField(FIELD.Message.ROLE, WIRE_TYPE.VARINT, role),
+    ...(images.length > 0
+      ? images.map((image) => encodeField(FIELD.Message.IMAGES, WIRE_TYPE.LEN, encodeImage(image)))
+      : []),
     encodeField(FIELD.Message.ID, WIRE_TYPE.LEN, messageId),
     ...(toolResults.length > 0
       ? toolResults.map((tr) =>

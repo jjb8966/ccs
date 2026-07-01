@@ -65,7 +65,14 @@ export function encodeRequest(
       encodeField(
         FIELD.Chat.MESSAGES,
         WIRE_TYPE.LEN,
-        encodeMessage(msg.content, role, msgId, chatModeEnum, msg.tool_results || [])
+        encodeMessage(
+          msg.content,
+          role,
+          msgId,
+          chatModeEnum,
+          msg.tool_results || [],
+          msg.images || []
+        )
       )
     );
 

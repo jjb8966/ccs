@@ -101,6 +101,46 @@ function mapThinkingToReasoningEffort(request: CursorAnthropicRequest): string |
     : 'medium';
 }
 
+function mapAnthropicImageToOpenAIUrl(
+  block: AnthropicContentBlock,
+  label: string
+): { type: 'image_url'; image_url: { url: string } } {
+  if (block.type !== 'image') {
+    throw new Error(`${label} is not an image block`);
+  }
+
+  const source = block.source;
+  if (!source || typeof source !== 'object') {
+    throw new Error(`${label}.source must be an object`);
+  }
+
+  if (source.type === 'base64') {
+    if (typeof source.data !== 'string' || source.data.length === 0) {
+      throw new Error(`${label}.source.data must be a non-empty base64 string`);
+    }
+    const mediaType =
+      typeof source.media_type === 'string' && source.media_type.length > 0
+        ? source.media_type
+        : 'image/png';
+    return {
+      type: 'image_url',
+      image_url: { url: `data:${mediaType};base64,${source.data}` },
+    };
+  }
+
+  if (source.type === 'url') {
+    if (typeof source.url !== 'string' || source.url.length === 0) {
+      throw new Error(`${label}.source.url must be a non-empty string`);
+    }
+    return {
+      type: 'image_url',
+      image_url: { url: source.url },
+    };
+  }
+
+  throw new Error(`${label}.source.type must be "base64" or "url"`);
+}
+
 export function translateAnthropicRequest(raw: unknown): TranslatedAnthropicRequest {
   const request = assertObject(raw, 'request') as CursorAnthropicRequest;
   const translatedMessages: CursorOpenAIMessage[] = [];
@@ -133,6 +173,7 @@ export function translateAnthropicRequest(raw: unknown): TranslatedAnthropicRequ
     }
 
     const textParts: string[] = [];
+    const imageParts: Array<{ type: 'image_url'; image_url: { url: string } }> = [];
     const toolCalls: NonNullable<CursorOpenAIMessage['tool_calls']> = [];
     let sawToolResult = false;
 
@@ -144,6 +185,18 @@ export function translateAnthropicRequest(raw: unknown): TranslatedAnthropicRequ
 
       if (parsed.type === 'text') {
         textParts.push(typeof parsed.text === 'string' ? parsed.text : '');
+        return;
+      }
+
+      if (parsed.type === 'image') {
+        if (role !== 'user') {
+          throw new Error(
+            `messages[${messageIndex}].content[${blockIndex}] image requires user role`
+          );
+        }
+        imageParts.push(
+          mapAnthropicImageToOpenAIUrl(parsed, `messages[${messageIndex}].content[${blockIndex}]`)
+        );
         return;
       }
 
@@ -211,11 +264,18 @@ export function translateAnthropicRequest(raw: unknown): TranslatedAnthropicRequ
       return;
     }
 
-    if (textParts.length > 0 || !sawToolResult) {
-      translatedMessages.push({
-        role,
-        content: textParts.join('\n'),
-      });
+    if (textParts.length > 0 || imageParts.length > 0 || !sawToolResult) {
+      if (imageParts.length > 0) {
+        translatedMessages.push({
+          role,
+          content: [...textParts.map((text) => ({ type: 'text' as const, text })), ...imageParts],
+        });
+      } else {
+        translatedMessages.push({
+          role,
+          content: textParts.join('\n'),
+        });
+      }
     }
   });
 

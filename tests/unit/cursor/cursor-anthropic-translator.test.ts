@@ -52,10 +52,46 @@ describe('translateAnthropicRequest', () => {
     ]);
   });
 
+  it('maps Anthropic image blocks into OpenAI image_url content parts', () => {
+    const tinyPng =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const translated = translateAnthropicRequest({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What is in this image?' },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: tinyPng,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(translated.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is in this image?' },
+          {
+            type: 'image_url',
+            image_url: { url: `data:image/png;base64,${tinyPng}` },
+          },
+        ],
+      },
+    ]);
+  });
+
   it('rejects unsupported content blocks', () => {
     expect(() =>
       translateAnthropicRequest({
-        messages: [{ role: 'user', content: [{ type: 'image' }] }],
+        messages: [{ role: 'user', content: [{ type: 'document' }] }],
       })
     ).toThrow('is not supported');
   });

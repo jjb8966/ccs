@@ -89,9 +89,22 @@ export const FIELD = {
   Message: {
     CONTENT: 1,
     ROLE: 2,
+    IMAGES: 10,
     ID: 13,
     TOOL_RESULTS: 18,
     CHAT_MODE_ENUM: 47,
+  },
+
+  /** ConversationMessage.ImageProto */
+  Image: {
+    DATA: 1,
+    DIMENSION: 2,
+  },
+
+  /** ConversationMessage.ImageProto.Dimension */
+  ImageDimension: {
+    WIDTH: 1,
+    HEIGHT: 2,
   },
 
   /** ConversationMessage.ToolResult */
@@ -187,10 +200,18 @@ export interface CursorToolResult {
   raw_args?: string;
 }
 
+/** Image attachment for ConversationMessage.images (field 10). */
+export interface CursorMessageImage {
+  data: Uint8Array;
+  width?: number;
+  height?: number;
+}
+
 /** Cursor message format */
 export interface CursorMessage {
   role: string;
   content: string;
+  images?: CursorMessageImage[];
   tool_results?: CursorToolResult[];
   tool_calls?: Array<{
     id: string;

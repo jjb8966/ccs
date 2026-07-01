@@ -213,6 +213,66 @@ describe('Message Translation', () => {
       expect(result.messages[1].content).toBe('Hi there!');
     });
 
+    it('should extract base64 image_url parts into Cursor message images', () => {
+      const tinyPng =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+      const result = buildCursorRequest(
+        'composer-2.5',
+        {
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'Describe this screenshot' },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: `data:image/png;base64,${tinyPng}`,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        false,
+        {}
+      );
+
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0].content).toBe('Describe this screenshot');
+      expect(result.messages[0].images).toHaveLength(1);
+      expect(result.messages[0].images![0].data.length).toBeGreaterThan(0);
+    });
+
+    it('should keep image-only user messages', () => {
+      const tinyPng =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+      const result = buildCursorRequest(
+        'composer-2.5',
+        {
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: `data:image/png;base64,${tinyPng}`,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        false,
+        {}
+      );
+
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0].content).toBe('');
+      expect(result.messages[0].images).toHaveLength(1);
+    });
+
     it('should handle assistant messages with tool_calls', () => {
       const result = buildCursorRequest(
         'gpt-4',
@@ -760,6 +820,34 @@ describe('Request Encoding', () => {
       expect(decoder.decode(encodedMessages[0].get(FIELD.Message.CONTENT)?.[0]?.value as Uint8Array)).toBe(
         'Hello'
       );
+    });
+
+    it('should encode image attachments on ConversationMessage field 10', () => {
+      const tinyPng = Uint8Array.from(
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+          'base64'
+        )
+      );
+
+      const result = generateCursorBody(
+        [{ role: 'user', content: 'look', images: [{ data: tinyPng, width: 1, height: 1 }] }],
+        'composer-2.5',
+        [],
+        null
+      );
+      const topLevel = decodeMessage(result);
+      const requestPayload = topLevel.get(FIELD.Request.REQUEST)?.[0]?.value as Uint8Array;
+      const chatRequest = decodeMessage(requestPayload);
+      const encodedMessages = (chatRequest.get(FIELD.Chat.MESSAGES) || []).map((entry) =>
+        decodeMessage(entry.value as Uint8Array)
+      );
+      const imageEntries = encodedMessages[0].get(FIELD.Message.IMAGES) || [];
+      const imageProto = decodeMessage(imageEntries[0].value as Uint8Array);
+      const imageData = imageProto.get(FIELD.Image.DATA)?.[0]?.value as Uint8Array;
+
+      expect(imageEntries).toHaveLength(1);
+      expect(Buffer.from(imageData).equals(Buffer.from(tinyPng))).toBe(true);
     });
 
     it('should encode message with tools into the raw request payload', () => {
