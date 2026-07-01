@@ -14,6 +14,7 @@
  * - storage.serviceMachineId: Machine ID for checksum
  */
 
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -360,6 +361,142 @@ export function extractUserInfo(
  */
 export function getCredentialsPath(): string {
   return path.join(getCcsDir(), 'cursor', 'credentials.json');
+}
+
+export function getCliproxyAuthDir(): string {
+  return path.join(getCcsDir(), 'cliproxy', 'auth');
+}
+
+/**
+ * Derive a stable 32-hex machine ID from a CLIProxy Cursor OAuth subject.
+ */
+export function deriveMachineIdFromCliproxySubject(subject: string): string {
+  const normalized = subject.trim();
+  if (!normalized) {
+    throw new Error('CLIProxy Cursor auth subject is empty');
+  }
+
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 32);
+}
+
+function resolveMachineIdForCliproxyImport(subject: string): string {
+  const localMachineId = detectLocalMachineId();
+  if (localMachineId) {
+    return localMachineId;
+  }
+
+  return deriveMachineIdFromCliproxySubject(subject);
+}
+
+/**
+ * Read a local Cursor IDE machine ID without requiring a stored access token.
+ */
+export function detectLocalMachineId(): string | null {
+  const checkedPaths = getTokenStorageCandidates().filter((candidate) => fs.existsSync(candidate));
+
+  for (const dbPath of checkedPaths) {
+    const machineIdResult = queryStateDbKeys(dbPath, MACHINE_ID_KEYS);
+    if (!machineIdResult.sqliteAvailable || machineIdResult.queryFailed || !machineIdResult.value) {
+      continue;
+    }
+
+    const normalized = machineIdResult.value.replace(/-/g, '');
+    if (/^[a-f0-9]{32}$/i.test(normalized)) {
+      return normalized.toLowerCase();
+    }
+  }
+
+  return null;
+}
+
+interface CliproxyCursorAuthRecord {
+  access_token?: unknown;
+  disabled?: unknown;
+  sub?: unknown;
+  type?: unknown;
+}
+
+function parseCliproxyCursorAuthRecord(filePath: string): CliproxyCursorAuthRecord | null {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === 'object' && parsed !== null
+      ? (parsed as CliproxyCursorAuthRecord)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function findCliproxyCursorAuthFiles(authDir: string = getCliproxyAuthDir()): string[] {
+  if (!fs.existsSync(authDir)) {
+    return [];
+  }
+
+  return fs
+    .readdirSync(authDir)
+    .filter((name) => name.startsWith('cursor') && name.endsWith('.json'))
+    .map((name) => path.join(authDir, name))
+    .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+}
+
+export function importCliproxyCursorCredentials(
+  options: {
+    authDir?: string;
+    force?: boolean;
+  } = {}
+): {
+  imported: boolean;
+  credentials?: CursorCredentials;
+  sourceFile?: string;
+  error?: string;
+} {
+  const existing = loadCredentials();
+  if (existing && !options.force) {
+    return {
+      imported: false,
+      credentials: existing,
+      error: 'Native Cursor credentials already exist',
+    };
+  }
+
+  const authFiles = findCliproxyCursorAuthFiles(options.authDir);
+  for (const filePath of authFiles) {
+    const record = parseCliproxyCursorAuthRecord(filePath);
+    if (!record || record.disabled === true || record.type !== 'cursor') {
+      continue;
+    }
+
+    const accessToken =
+      typeof record.access_token === 'string' && record.access_token.trim().length > 0
+        ? record.access_token.trim()
+        : '';
+    const subject = typeof record.sub === 'string' ? record.sub.trim() : '';
+    if (!accessToken || !subject) {
+      continue;
+    }
+
+    const machineId = resolveMachineIdForCliproxyImport(subject);
+    if (!validateToken(accessToken, machineId)) {
+      continue;
+    }
+
+    const credentials: CursorCredentials = {
+      accessToken,
+      machineId,
+      authMethod: 'manual',
+      importedAt: new Date().toISOString(),
+      userId: subject,
+    };
+
+    saveCredentials(credentials);
+    return { imported: true, credentials, sourceFile: filePath };
+  }
+
+  return {
+    imported: false,
+    error: 'No usable CLIProxy Cursor auth file found in cliproxy/auth',
+  };
 }
 
 /**

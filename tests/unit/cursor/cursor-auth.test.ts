@@ -17,27 +17,40 @@ import {
   deleteCredentials,
   autoDetectTokens,
   getTokenStorageCandidates,
+  deriveMachineIdFromCliproxySubject,
+  findCliproxyCursorAuthFiles,
+  importCliproxyCursorCredentials,
+  getCliproxyAuthDir,
 } from '../../../src/cursor/cursor-auth';
 
 // Test isolation
 let originalCcsHome: string | undefined;
+let originalCcsDir: string | undefined;
 let tempDir: string;
 
 beforeEach(() => {
-  // Save original CCS_HOME
+  // Save original CCS_HOME/CCS_DIR
   originalCcsHome = process.env.CCS_HOME;
+  originalCcsDir = process.env.CCS_DIR;
 
   // Create temp directory for test isolation
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccs-cursor-test-'));
+  delete process.env.CCS_DIR;
   process.env.CCS_HOME = tempDir;
 });
 
 afterEach(() => {
-  // Restore original CCS_HOME
+  // Restore original CCS_HOME/CCS_DIR
   if (originalCcsHome !== undefined) {
     process.env.CCS_HOME = originalCcsHome;
   } else {
     delete process.env.CCS_HOME;
+  }
+
+  if (originalCcsDir !== undefined) {
+    process.env.CCS_DIR = originalCcsDir;
+  } else {
+    delete process.env.CCS_DIR;
   }
 
   // Clean up temp directory
@@ -617,6 +630,90 @@ describe('autoDetectTokens', () => {
       const result = autoDetectTokens();
       expect(result.found).toBe(false);
       expect(result.reason).toBe('db_query_failed');
+    } finally {
+      if (originalHome !== undefined) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+    }
+  });
+});
+
+describe('importCliproxyCursorCredentials', () => {
+  it('derives a stable machine ID from CLIProxy subject', () => {
+    const first = deriveMachineIdFromCliproxySubject('google-oauth2|user_01KW6VQTDV4ZEYMTBHJ56V8V1J');
+    const second = deriveMachineIdFromCliproxySubject('google-oauth2|user_01KW6VQTDV4ZEYMTBHJ56V8V1J');
+    expect(first).toHaveLength(32);
+    expect(first).toBe(second);
+  });
+
+  it('imports credentials from cliproxy auth storage', () => {
+    const authDir = path.join(tempDir, 'cliproxy', 'auth');
+    fs.mkdirSync(authDir, { recursive: true });
+    const token = 'a'.repeat(50);
+    fs.writeFileSync(
+      path.join(authDir, 'cursor.test.json'),
+      JSON.stringify({
+        access_token: token,
+        sub: 'google-oauth2|user_test',
+        type: 'cursor',
+        disabled: false,
+      })
+    );
+
+    const originalHome = process.env.HOME;
+    process.env.HOME = path.join(tempDir, 'isolated-home');
+    try {
+      const result = importCliproxyCursorCredentials({ authDir, force: true });
+      expect(result.imported).toBe(true);
+      expect(result.credentials?.accessToken).toBe(token);
+      expect(result.credentials?.machineId).toBe(
+        deriveMachineIdFromCliproxySubject('google-oauth2|user_test')
+      );
+      expect(loadCredentials()?.machineId).toBe(result.credentials?.machineId);
+      expect(findCliproxyCursorAuthFiles(authDir)).toHaveLength(1);
+      expect(getCliproxyAuthDir()).toContain('cliproxy');
+    } finally {
+      if (originalHome !== undefined) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+    }
+  });
+
+  it('prefers a local Cursor IDE machine ID when importing CLIProxy credentials', () => {
+    const authDir = path.join(tempDir, 'cliproxy', 'auth');
+    fs.mkdirSync(authDir, { recursive: true });
+    const token = 'a'.repeat(50);
+    fs.writeFileSync(
+      path.join(authDir, 'cursor.test.json'),
+      JSON.stringify({
+        access_token: token,
+        sub: 'google-oauth2|user_test',
+        type: 'cursor',
+        disabled: false,
+      })
+    );
+
+    const originalHome = process.env.HOME;
+    const fakeHome = path.join(tempDir, 'fake-home');
+    process.env.HOME = fakeHome;
+    const dbPath = path.join(
+      fakeHome,
+      'Library/Application Support/Cursor/User/globalStorage/state.vscdb'
+    );
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+    try {
+      if (process.platform === 'win32') {
+        return;
+      }
+      execFileSync('sqlite3', ['--version'], { stdio: 'ignore' });
+      execFileSync(
+        'sqlite3',
+        [dbPath, "CREATE TABLE itemTable (key TEXT, value TEXT); INSERT INTO itemTable VALUES ('storage.serviceMachineId', 'abcdef0123456789abcdef0123456789');"],
+        { stdio: 'ignore' }
+      );
+
+      const result = importCliproxyCursorCredentials({ authDir, force: true });
+      expect(result.imported).toBe(true);
+      expect(result.credentials?.machineId).toBe('abcdef0123456789abcdef0123456789');
     } finally {
       if (originalHome !== undefined) process.env.HOME = originalHome;
       else delete process.env.HOME;

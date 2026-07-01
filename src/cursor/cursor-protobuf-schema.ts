@@ -19,9 +19,31 @@ export const ROLE = {
 
 /** Unified mode constants */
 export const UNIFIED_MODE = {
-  CHAT: 1,
+  UNSPECIFIED: 0,
+  NORMAL: 1,
   AGENT: 2,
 } as const;
+
+/** ClientSideToolV2 enum subset used for agent-mode capability advertisement */
+export const CLIENT_SIDE_TOOL_V2 = {
+  READ_FILE: 5,
+  LIST_DIR: 6,
+  EDIT_FILE: 7,
+  FILE_SEARCH: 8,
+  RIPGREP_SEARCH: 3,
+  RUN_TERMINAL_COMMAND_V2: 15,
+  GLOB_FILE_SEARCH: 42,
+} as const;
+
+export const DEFAULT_SUPPORTED_CLIENT_TOOLS = [
+  CLIENT_SIDE_TOOL_V2.READ_FILE,
+  CLIENT_SIDE_TOOL_V2.LIST_DIR,
+  CLIENT_SIDE_TOOL_V2.RIPGREP_SEARCH,
+  CLIENT_SIDE_TOOL_V2.RUN_TERMINAL_COMMAND_V2,
+  CLIENT_SIDE_TOOL_V2.EDIT_FILE,
+  CLIENT_SIDE_TOOL_V2.FILE_SEARCH,
+  CLIENT_SIDE_TOOL_V2.GLOB_FILE_SEARCH,
+] as const;
 
 /** Thinking level constants */
 export const THINKING_LEVEL = {
@@ -69,9 +91,7 @@ export const FIELD = {
     ROLE: 2,
     ID: 13,
     TOOL_RESULTS: 18,
-    IS_AGENTIC: 29,
-    UNIFIED_MODE: 47,
-    SUPPORTED_TOOLS: 51,
+    CHAT_MODE_ENUM: 47,
   },
 
   /** ConversationMessage.ToolResult */
@@ -122,7 +142,13 @@ export const FIELD = {
   McpNested: { NAME: 1, PARAMS: 3 },
 
   /** StreamUnifiedChatResponse */
-  ChatResponse: { TEXT: 1, THINKING: 25 },
+  ChatResponse: {
+    TEXT: 1,
+    ERROR_TEXT: 20,
+    STREAM_DELTA: 25,
+    THINKING: 25,
+    STREAM_FLAG: 37,
+  },
 
   /** Thinking */
   Thinking: { TEXT: 1 },

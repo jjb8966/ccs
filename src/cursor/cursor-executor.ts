@@ -4,7 +4,11 @@
  */
 
 import type { IncomingHttpHeaders } from 'http';
-import { generateCursorBody, extractTextFromResponse } from './cursor-protobuf.js';
+import {
+  generateCursorBody,
+  extractTextFromResponse,
+  wrapConnectRPCFrame,
+} from './cursor-protobuf.js';
 import { buildCursorRequest } from './cursor-translator.js';
 import {
   isEndStreamConnectFrame,
@@ -13,9 +17,13 @@ import {
 } from './cursor-protobuf-schema.js';
 import { buildCursorConnectHeaders, generateCursorChecksum } from './cursor-client-policy.js';
 import { createLogger } from '../services/logging';
-
-const logger = createLogger('cursor:executor');
-
+import {
+  AssistantResponseStreamParser,
+  extractRedactedToolCalls,
+  type AssistantStreamEvent,
+  remapCursorInternalToolCalls,
+  type ParsedOpenAIToolCall,
+} from './cursor-redacted-tool-parser.js';
 import {
   CursorConnectFrameError,
   type FrameResult,
@@ -23,6 +31,41 @@ import {
   decompressPayload,
   mapCursorConnectError,
 } from './cursor-stream-parser.js';
+
+import {
+  AssistantVisibleTextNormalizer,
+  normalizeAssistantVisibleText,
+} from './cursor-assistant-text-normalizer.js';
+
+const logger = createLogger('cursor:executor');
+
+const FINAL_RESPONSE_MARKERS = ['</think>', '<｜final｜>', '<|final|>'];
+
+function splitAssistantContent(raw: string): { content: string; reasoning: string } {
+  for (const marker of FINAL_RESPONSE_MARKERS) {
+    const index = raw.indexOf(marker);
+    if (index !== -1) {
+      return {
+        reasoning: raw.slice(0, index).trim(),
+        content: normalizeAssistantVisibleText(raw.slice(index + marker.length)),
+      };
+    }
+  }
+
+  return { content: normalizeAssistantVisibleText(raw), reasoning: '' };
+}
+
+const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 30_000;
+
+function getFirstByteTimeoutMs(): number {
+  const raw = process.env.CCS_CURSOR_FIRST_BYTE_TIMEOUT_MS;
+  if (!raw) {
+    return DEFAULT_FIRST_BYTE_TIMEOUT_MS;
+  }
+
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_FIRST_BYTE_TIMEOUT_MS;
+}
 
 /** Executor parameters */
 interface ExecutorParams {
@@ -140,7 +183,7 @@ function toCursorExecutorErrorPayload(error: unknown): CursorExecutorErrorPayloa
 
 export class CursorExecutor {
   private readonly baseUrl = 'https://api2.cursor.sh';
-  private readonly chatPath = '/aiserver.v1.AiService/StreamChat';
+  private readonly chatPath = '/aiserver.v1.ChatService/StreamUnifiedChatWithTools';
 
   buildUrl(): string {
     return `${this.baseUrl}${this.chatPath}`;
@@ -167,7 +210,7 @@ export class CursorExecutor {
     const messages = translatedBody.messages || [];
     const tools = (translatedBody.tools || body.tools || []) as CursorTool[];
     const reasoningEffort = body.reasoning_effort || null;
-    return generateCursorBody(messages, model, tools, reasoningEffort);
+    return wrapConnectRPCFrame(generateCursorBody(messages, model, tools, reasoningEffort), false);
   }
 
   async makeFetchRequest(
@@ -484,7 +527,11 @@ export class CursorExecutor {
 
         // Status 200: set up incremental streaming pipeline
         const parser = new StreamingFrameParser();
+        const assistantParser = new AssistantResponseStreamParser();
+        const textNormalizer = new AssistantVisibleTextNormalizer();
         const enc = new TextEncoder();
+        const firstByteTimeoutMs = getFirstByteTimeoutMs();
+        let firstByteTimer: NodeJS.Timeout | null = null;
         const toolCallsMap = new Map<
           string,
           {
@@ -550,6 +597,10 @@ export class CursorExecutor {
         const closeStream = () => {
           if (streamClosed) return;
           streamClosed = true;
+          if (firstByteTimer) {
+            clearTimeout(firstByteTimer);
+            firstByteTimer = null;
+          }
           if (streamController) {
             try {
               streamController.close();
@@ -569,7 +620,68 @@ export class CursorExecutor {
             choices: [{ index: 0, delta, finish_reason: finishReason }],
           });
 
+        const availableToolNames = (requestBody.tools ?? [])
+          .map((tool) => tool.function?.name)
+          .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
+
+        const emitRedactedToolCalls = (calls: ParsedOpenAIToolCall[]) => {
+          const normalizedCalls = remapCursorInternalToolCalls(calls, availableToolNames);
+          if (normalizedCalls.length === 0) {
+            return;
+          }
+
+          if (chunkCount === 0) {
+            emitSSE(buildChunk({ role: 'assistant', content: '' }, null));
+            chunkCount++;
+          }
+
+          for (const tc of normalizedCalls) {
+            const idx = toolCallCount++;
+            emitSSE(
+              buildChunk(
+                {
+                  tool_calls: [
+                    {
+                      index: idx,
+                      id: tc.id,
+                      type: 'function',
+                      function: tc.function,
+                    },
+                  ],
+                },
+                null
+              )
+            );
+            chunkCount++;
+          }
+        };
+
+        const handleAssistantEvents = (events: AssistantStreamEvent[]) => {
+          for (const event of events) {
+            if (event.kind === 'tool_calls') {
+              emitRedactedToolCalls(event.toolCalls);
+              continue;
+            }
+
+            const visibleText = textNormalizer.push(event.text);
+            if (!visibleText) {
+              continue;
+            }
+
+            const delta =
+              chunkCount === 0 && toolCallCount === 0
+                ? { role: 'assistant', content: visibleText }
+                : { content: visibleText };
+            emitSSE(buildChunk(delta, null));
+            chunkCount++;
+          }
+        };
+
         const handleFrameError = (frame: Extract<FrameResult, { type: 'error' }>) => {
+          if (firstByteTimer) {
+            clearTimeout(firstByteTimer);
+            firstByteTimer = null;
+          }
           const errorPayload = buildCursorErrorEnvelope({
             message: frame.message,
             status: frame.status,
@@ -595,8 +707,29 @@ export class CursorExecutor {
           closeStream();
         };
 
+        const armFirstByteTimeout = () => {
+          if (firstByteTimer) {
+            clearTimeout(firstByteTimer);
+          }
+          firstByteTimer = setTimeout(() => {
+            if (streamClosed) return;
+            handleFrameError({
+              type: 'error',
+              message: `Cursor upstream did not send the first frame within ${firstByteTimeoutMs}ms`,
+              status: 504,
+              errorType: 'timeout_error',
+            });
+          }, firstByteTimeoutMs);
+        };
+
+        armFirstByteTimeout();
+
         req.on('data', (chunk: Buffer) => {
           if (streamClosed) return;
+          if (firstByteTimer) {
+            clearTimeout(firstByteTimer);
+            firstByteTimer = null;
+          }
           for (const frame of parser.push(chunk)) {
             if (frame.type === 'error') {
               handleFrameError(frame);
@@ -666,21 +799,11 @@ export class CursorExecutor {
             }
 
             if (frame.type === 'text') {
-              const delta =
-                chunkCount === 0 && toolCallCount === 0
-                  ? { role: 'assistant', content: frame.text }
-                  : { content: frame.text };
-              emitSSE(buildChunk(delta, null));
-              chunkCount++;
+              handleAssistantEvents(assistantParser.push(frame.text));
             }
 
             if (frame.type === 'thinking') {
-              const delta =
-                chunkCount === 0 && toolCallCount === 0
-                  ? { role: 'assistant', reasoning_content: frame.text }
-                  : { reasoning_content: frame.text };
-              emitSSE(buildChunk(delta, null));
-              chunkCount++;
+              handleAssistantEvents(assistantParser.push(frame.text));
             }
           }
         });
@@ -693,6 +816,7 @@ export class CursorExecutor {
               return;
             }
           }
+          handleAssistantEvents(assistantParser.finish());
           resolveStreamingResponse();
           if (chunkCount === 0 && toolCallCount === 0) {
             emitSSE(buildChunk({ role: 'assistant', content: '' }, null));
@@ -878,7 +1002,7 @@ export class CursorExecutor {
     }
   }
 
-  transformProtobufToJSON(buffer: Buffer, model: string, _body: ExecutorParams['body']): Response {
+  transformProtobufToJSON(buffer: Buffer, model: string, body: ExecutorParams['body']): Response {
     const responseId = `chatcmpl-cursor-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
 
@@ -959,6 +1083,21 @@ export class CursorExecutor {
       }
     }
 
+    const combinedRaw = `${totalContent}${totalReasoning}`;
+    const availableToolNames = (body.tools ?? [])
+      .map((tool) => tool.function?.name)
+      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
+    const redacted = extractRedactedToolCalls(combinedRaw);
+    if (redacted.toolCalls.length > 0) {
+      for (const tc of remapCursorInternalToolCalls(redacted.toolCalls, availableToolNames)) {
+        if (!toolCalls.find((existing) => existing.id === tc.id)) {
+          toolCalls.push(tc);
+        }
+      }
+    }
+
+    const contentSource = redacted.toolCalls.length > 0 ? redacted.text : totalContent;
+    const split = splitAssistantContent(contentSource);
     const message: {
       role: string;
       content: string | null;
@@ -970,15 +1109,19 @@ export class CursorExecutor {
       }>;
     } = {
       role: 'assistant',
-      content: totalContent || null,
+      content: split.content || null,
     };
+
+    const reasoning =
+      redacted.toolCalls.length > 0
+        ? splitAssistantContent(combinedRaw).reasoning
+        : split.reasoning || totalReasoning.trim();
+    if (reasoning) {
+      message.reasoning_content = reasoning;
+    }
 
     if (toolCalls.length > 0) {
       message.tool_calls = toolCalls;
-    }
-
-    if (totalReasoning) {
-      message.reasoning_content = totalReasoning;
     }
 
     const completion = {

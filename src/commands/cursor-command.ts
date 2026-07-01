@@ -129,6 +129,26 @@ function printAutoDetectFailure(result: {
 async function handleAuth(args: string[]): Promise<number> {
   printLegacyCursorDeprecationNotice();
   const manual = args.includes('--manual');
+  const importCliproxy = args.includes('--import-cliproxy');
+
+  if (importCliproxy) {
+    const { importCliproxyCursorCredentials } = await import('../cursor');
+    const result = importCliproxyCursorCredentials({ force: args.includes('--force') });
+    if (!result.imported || !result.credentials) {
+      console.error(fail(result.error ?? 'Failed to import CLIProxy Cursor credentials'));
+      return 1;
+    }
+
+    console.log(ok('Imported Cursor credentials from CLIProxy auth storage'));
+    if (result.sourceFile) {
+      console.log(info(`Source: ${result.sourceFile}`));
+    }
+    console.log('');
+    console.log('Next steps:');
+    console.log(`  1. Enable integration: ${LEGACY_CURSOR_COMMAND} enable`);
+    console.log(`  2. Start daemon:       ${LEGACY_CURSOR_COMMAND} start`);
+    return 0;
+  }
 
   if (manual) {
     const accessToken =

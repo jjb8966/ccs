@@ -100,6 +100,16 @@ describe('translateAnthropicRequest', () => {
     expect(translated.reasoning_effort).toBe('high');
   });
 
+  it('omits reasoning effort for adaptive auto thinking', () => {
+    const translated = translateAnthropicRequest({
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'auto' },
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+
+    expect(translated.reasoning_effort).toBeUndefined();
+  });
+
   it('preserves mixed user text around tool_result blocks in order', () => {
     const translated = translateAnthropicRequest({
       messages: [

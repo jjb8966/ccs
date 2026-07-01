@@ -5,19 +5,34 @@
  */
 
 import * as crypto from 'crypto';
+import * as os from 'os';
 import type { CursorApiCredentials } from './cursor-protobuf-schema';
 
-export const CURSOR_CLIENT_VERSION = '2.3.41';
+export const CURSOR_CLIENT_VERSION = process.env.CCS_CURSOR_CLIENT_VERSION?.trim() || '3.9.8';
 export const CURSOR_USER_AGENT = 'connect-es/1.6.1';
 
+const UUID_DNS_NAMESPACE = Buffer.from('6ba7b8109dad11d180b400c04fd42911', 'hex');
+
 function getClientOs(): string {
-  if (process.platform === 'win32') return 'windows';
-  if (process.platform === 'darwin') return 'macos';
+  if (process.platform === 'win32') return 'win32';
+  if (process.platform === 'darwin') return 'darwin';
   return 'linux';
 }
 
 function getClientArch(): string {
-  return process.arch === 'arm64' ? 'aarch64' : 'x64';
+  if (process.arch === 'arm64') return 'arm64';
+  return 'x64';
+}
+
+function generateSessionId(authToken: string): string {
+  const hash = crypto.createHash('sha1');
+  hash.update(UUID_DNS_NAMESPACE);
+  hash.update(authToken);
+  const bytes = hash.digest();
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 export function normalizeCursorAccessToken(accessToken: string): string {
@@ -97,12 +112,14 @@ function buildCursorBaseHeaders(credentials: CursorApiCredentials): Record<strin
     'x-cursor-client-type': 'ide',
     'x-cursor-client-os': getClientOs(),
     'x-cursor-client-arch': getClientArch(),
+    'x-cursor-client-os-version': os.release() || 'unknown',
     'x-cursor-client-device-type': 'desktop',
     'x-cursor-config-version': crypto.randomUUID(),
     'x-cursor-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     'x-ghost-mode': ghostMode ? 'true' : 'false',
+    'x-new-onboarding-completed': 'false',
     'x-request-id': crypto.randomUUID(),
-    'x-session-id': tokenHash.substring(0, 36),
+    'x-session-id': generateSessionId(cleanToken),
   };
 }
 

@@ -125,6 +125,14 @@ function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
+function getExpectedAnthropicAuthToken(): string {
+  return (
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    process.env.CCS_PROXY_TOKEN ||
+    'cursor-managed'
+  ).trim();
+}
+
 function hasValidDaemonToken(req: http.IncomingMessage): boolean {
   const expectedToken = process.env.CCS_CURSOR_DAEMON_TOKEN;
   if (!expectedToken) {
@@ -141,6 +149,19 @@ function hasValidDaemonToken(req: http.IncomingMessage): boolean {
   }
 
   return false;
+}
+
+function hasValidProxyBearerToken(req: http.IncomingMessage): boolean {
+  const expectedToken = getExpectedAnthropicAuthToken();
+  if (!expectedToken) {
+    return false;
+  }
+
+  return getAnthropicRequestToken(req.headers) === expectedToken;
+}
+
+function hasValidProtectedRouteAuth(req: http.IncomingMessage): boolean {
+  return hasValidDaemonToken(req) || hasValidProxyBearerToken(req);
 }
 function normalizeMessages(raw: unknown): NormalizedOpenAIMessage[] {
   if (!Array.isArray(raw)) {
@@ -225,6 +246,56 @@ function parseArgs(argv: string[]): DaemonRuntimeOptions {
   return { port, ghostMode };
 }
 
+function buildOllamaShowResponse(modelId: string) {
+  return {
+    modelfile: `# CCS native cursor provider\nFROM ${modelId}`,
+    parameters: '',
+    template: '',
+    details: {
+      parent_model: '',
+      format: '',
+      family: 'cursor',
+      families: ['cursor'],
+      parameter_size: 'unknown',
+      quantization_level: 'unknown',
+    },
+    model_info: {
+      'general.architecture': 'cursor',
+    },
+    capabilities: ['completion', 'tools', 'function_calling'],
+  };
+}
+
+function buildOllamaTagsResponse(modelIds: string[]) {
+  const modifiedAt = new Date().toISOString();
+  return {
+    models: modelIds.map((modelId) => ({
+      name: modelId,
+      model: modelId,
+      modified_at: modifiedAt,
+      size: 0,
+      digest: '',
+      details: {
+        parent_model: '',
+        format: '',
+        family: 'cursor',
+        families: ['cursor'],
+        parameter_size: 'unknown',
+        quantization_level: 'unknown',
+      },
+    })),
+  };
+}
+
+function resolveBindHost(): string {
+  const configured = process.env.CCS_CURSOR_BIND_HOST?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  return '127.0.0.1';
+}
+
 export function startCursorDaemonServer(options: DaemonRuntimeOptions): http.Server {
   const executor = new CursorExecutor();
 
@@ -233,6 +304,8 @@ export function startCursorDaemonServer(options: DaemonRuntimeOptions): http.Ser
     const requestUrl = req.url || '/';
     const isOpenAiRoute = method === 'POST' && requestUrl === '/v1/chat/completions';
     const isAnthropicRoute = method === 'POST' && requestUrl === '/v1/messages';
+    const isOllamaShowRoute = method === 'POST' && requestUrl === '/api/show';
+    const isOllamaTagsRoute = method === 'GET' && requestUrl === '/api/tags';
 
     try {
       if (method === 'GET' && requestUrl === '/health') {
@@ -244,7 +317,66 @@ export function startCursorDaemonServer(options: DaemonRuntimeOptions): http.Ser
         return;
       }
 
+      if (isOllamaTagsRoute) {
+        if (!hasValidProtectedRouteAuth(req)) {
+          writeJson(res, 401, { error: 'Unauthorized' });
+          return;
+        }
+
+        const authStatus = checkAuthStatus();
+        const models = await getModelsForDaemon({
+          credentials:
+            authStatus.authenticated && !authStatus.expired && authStatus.credentials
+              ? {
+                  accessToken: authStatus.credentials.accessToken,
+                  machineId: authStatus.credentials.machineId,
+                  ghostMode: options.ghostMode,
+                }
+              : null,
+        });
+        const modelIds = models.map((model) => model.id);
+        writeJson(res, 200, buildOllamaTagsResponse(modelIds));
+        return;
+      }
+
+      if (isOllamaShowRoute) {
+        if (!hasValidProtectedRouteAuth(req)) {
+          writeJson(res, 401, { error: 'Unauthorized' });
+          return;
+        }
+
+        const rawBody = (await readJsonBody(req)) as { name?: unknown };
+        const requestedName =
+          typeof rawBody.name === 'string' && rawBody.name.trim().length > 0
+            ? rawBody.name.trim()
+            : '';
+        if (!requestedName) {
+          writeJson(res, 400, { error: 'name is required' });
+          return;
+        }
+
+        const authStatus = checkAuthStatus();
+        const models = await getModelsForDaemon({
+          credentials:
+            authStatus.authenticated && !authStatus.expired && authStatus.credentials
+              ? {
+                  accessToken: authStatus.credentials.accessToken,
+                  machineId: authStatus.credentials.machineId,
+                  ghostMode: options.ghostMode,
+                }
+              : null,
+        });
+        const model = resolveCursorRequestModel(requestedName, models);
+        writeJson(res, 200, buildOllamaShowResponse(model));
+        return;
+      }
+
       if (method === 'GET' && requestUrl === '/v1/models') {
+        if (!hasValidProtectedRouteAuth(req)) {
+          writeJson(res, 401, { error: 'Unauthorized' });
+          return;
+        }
+
         const authStatus = checkAuthStatus();
         const models = await getModelsForDaemon({
           credentials:
@@ -272,7 +404,7 @@ export function startCursorDaemonServer(options: DaemonRuntimeOptions): http.Ser
         return;
       }
 
-      if (!hasValidDaemonToken(req)) {
+      if (!hasValidProtectedRouteAuth(req)) {
         writeJson(res, 401, { error: 'Unauthorized' });
         return;
       }
@@ -327,7 +459,7 @@ export function startCursorDaemonServer(options: DaemonRuntimeOptions): http.Ser
       }
 
       if (isAnthropicRoute) {
-        const expectedToken = (process.env.ANTHROPIC_AUTH_TOKEN || 'cursor-managed').trim();
+        const expectedToken = getExpectedAnthropicAuthToken();
         const requestToken = getAnthropicRequestToken(req.headers);
         if (!expectedToken || requestToken !== expectedToken) {
           await pipeWebResponseToNode(
@@ -412,7 +544,7 @@ export function startCursorDaemonServer(options: DaemonRuntimeOptions): http.Ser
     }
   });
 
-  server.listen(options.port, '127.0.0.1');
+  server.listen(options.port, resolveBindHost());
   return server;
 }
 

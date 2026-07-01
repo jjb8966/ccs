@@ -4,11 +4,11 @@
  */
 
 import * as zlib from 'zlib';
+import * as os from 'os';
 import {
   WIRE_TYPE,
   FIELD,
   COMPRESS_FLAG,
-  UNIFIED_MODE,
   type WireType,
   type RoleType,
   type CursorTool,
@@ -98,9 +98,8 @@ export function encodeMessage(
   content: string,
   role: RoleType,
   messageId: string,
-  isLast: boolean,
-  hasTools: boolean,
-  toolResults: CursorToolResult[]
+  chatModeEnum?: number,
+  toolResults: CursorToolResult[] = []
 ): Uint8Array {
   return concatArrays(
     encodeField(FIELD.Message.CONTENT, WIRE_TYPE.LEN, content),
@@ -111,14 +110,8 @@ export function encodeMessage(
           encodeField(FIELD.Message.TOOL_RESULTS, WIRE_TYPE.LEN, encodeToolResult(tr))
         )
       : []),
-    encodeField(FIELD.Message.IS_AGENTIC, WIRE_TYPE.VARINT, hasTools ? 1 : 0),
-    encodeField(
-      FIELD.Message.UNIFIED_MODE,
-      WIRE_TYPE.VARINT,
-      hasTools ? UNIFIED_MODE.AGENT : UNIFIED_MODE.CHAT
-    ),
-    ...(isLast && hasTools
-      ? [encodeField(FIELD.Message.SUPPORTED_TOOLS, WIRE_TYPE.LEN, encodeVarint(1))]
+    ...(chatModeEnum !== undefined
+      ? [encodeField(FIELD.Message.CHAT_MODE_ENUM, WIRE_TYPE.VARINT, chatModeEnum)]
       : [])
   );
 }
@@ -165,8 +158,8 @@ export function encodeMetadata(): Uint8Array {
   return concatArrays(
     encodeField(FIELD.Metadata.PLATFORM, WIRE_TYPE.LEN, process.platform || 'linux'),
     encodeField(FIELD.Metadata.ARCH, WIRE_TYPE.LEN, process.arch || 'x64'),
-    encodeField(FIELD.Metadata.VERSION, WIRE_TYPE.LEN, process.version || 'v20.0.0'),
-    encodeField(FIELD.Metadata.CWD, WIRE_TYPE.LEN, process.cwd() || '/'),
+    encodeField(FIELD.Metadata.VERSION, WIRE_TYPE.LEN, os.release() || 'unknown'),
+    encodeField(FIELD.Metadata.CWD, WIRE_TYPE.LEN, process.execPath || process.cwd() || '/'),
     encodeField(FIELD.Metadata.TIMESTAMP, WIRE_TYPE.LEN, new Date().toISOString())
   );
 }

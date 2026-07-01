@@ -15,6 +15,10 @@ export {
   loadCredentials,
   deleteCredentials,
   checkAuthStatus,
+  importCliproxyCursorCredentials,
+  deriveMachineIdFromCliproxySubject,
+  detectLocalMachineId,
+  findCliproxyCursorAuthFiles,
 } from './cursor-auth';
 
 // Daemon

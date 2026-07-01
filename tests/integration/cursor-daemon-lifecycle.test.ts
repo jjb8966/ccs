@@ -77,7 +77,9 @@ describe('cursor daemon lifecycle smoke', () => {
 
     expect(await isDaemonRunning(port, daemonToken)).toBe(true);
 
-    const modelsResponse = await fetch(`http://127.0.0.1:${port}/v1/models`);
+    const modelsResponse = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+      headers: { 'x-ccs-cursor-token': daemonToken },
+    });
     expect(modelsResponse.status).toBe(200);
     const modelsJson = (await modelsResponse.json()) as { object?: string; data?: unknown[] };
     expect(modelsJson.object).toBe('list');

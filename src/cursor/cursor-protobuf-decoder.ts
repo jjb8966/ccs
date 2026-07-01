@@ -247,44 +247,85 @@ function extractToolCall(toolCallData: Uint8Array): {
 /**
  * Extract text and thinking from response data
  */
+function decodeLenString(value: Uint8Array): string | null {
+  try {
+    const nested = decodeMessage(value);
+    const direct = nested.get(1)?.[0]?.value;
+    if (direct instanceof Uint8Array) {
+      return new TextDecoder().decode(direct);
+    }
+    return new TextDecoder().decode(value);
+  } catch {
+    return new TextDecoder().decode(value);
+  }
+}
+
 function extractTextAndThinking(responseData: Uint8Array): {
   text: string | null;
   thinking: string | null;
+  error: string | null;
 } {
   const nested = decodeMessage(responseData);
   let text: string | null = null;
   let thinking: string | null = null;
+  let error: string | null = null;
 
-  // Extract text
+  if (nested.has(FIELD.ChatResponse.ERROR_TEXT)) {
+    const errorField = nested.get(FIELD.ChatResponse.ERROR_TEXT);
+    if (errorField?.[0]?.value instanceof Uint8Array) {
+      error = new TextDecoder().decode(errorField[0].value as Uint8Array);
+    }
+  }
+
   if (nested.has(FIELD.ChatResponse.TEXT)) {
     const textField = nested.get(FIELD.ChatResponse.TEXT);
-    if (textField && textField[0]) {
+    if (textField?.[0]?.value instanceof Uint8Array) {
       text = new TextDecoder().decode(textField[0].value as Uint8Array);
     }
   }
 
-  // Extract thinking
-  if (nested.has(FIELD.ChatResponse.THINKING)) {
+  if (nested.has(FIELD.ChatResponse.STREAM_DELTA)) {
+    const deltaField = nested.get(FIELD.ChatResponse.STREAM_DELTA);
+    if (deltaField?.[0]?.value instanceof Uint8Array) {
+      const raw = deltaField[0].value as Uint8Array;
+      const inner = decodeMessage(raw);
+      if (inner.has(FIELD.ChatResponse.STREAM_FLAG)) {
+        const delta = decodeLenString(raw);
+        if (delta) {
+          text = (text || '') + delta;
+        }
+      } else if (inner.has(FIELD.Thinking.TEXT)) {
+        const thinkingTextField = inner.get(FIELD.Thinking.TEXT);
+        if (thinkingTextField?.[0]?.value instanceof Uint8Array) {
+          thinking = new TextDecoder().decode(thinkingTextField[0].value as Uint8Array);
+        }
+      } else {
+        const delta = decodeLenString(raw);
+        if (delta) {
+          text = (text || '') + delta;
+        }
+      }
+    }
+  }
+
+  if (!thinking && nested.has(FIELD.ChatResponse.THINKING)) {
     try {
       const thinkingField = nested.get(FIELD.ChatResponse.THINKING);
-      if (thinkingField && thinkingField[0]) {
+      if (thinkingField?.[0]?.value instanceof Uint8Array) {
         const thinkingMsg = decodeMessage(thinkingField[0].value as Uint8Array);
         if (thinkingMsg.has(FIELD.Thinking.TEXT)) {
           const thinkingTextField = thinkingMsg.get(FIELD.Thinking.TEXT);
-          if (thinkingTextField && thinkingTextField[0]) {
+          if (thinkingTextField?.[0]?.value instanceof Uint8Array) {
             thinking = new TextDecoder().decode(thinkingTextField[0].value as Uint8Array);
           }
         }
       }
-    } catch (err) {
-      if (process.env.CCS_DEBUG) {
-        console.error('[cursor] extractTextAndThinking parsing failed:', err);
-      }
-      // Thinking parse error, continue
+    } catch {
+      // ignore nested thinking parse errors
     }
   }
 
-  return { text, thinking };
+  return { text, thinking, error };
 }
 
 /**
@@ -318,8 +359,14 @@ export function extractTextFromResponse(payload: Uint8Array): {
     // Field 2: StreamUnifiedChatResponse
     if (fields.has(FIELD.Response.RESPONSE)) {
       const responseField = fields.get(FIELD.Response.RESPONSE);
-      if (responseField && responseField[0]) {
-        const { text, thinking } = extractTextAndThinking(responseField[0].value as Uint8Array);
+      if (responseField?.[0]?.value instanceof Uint8Array) {
+        const { text, thinking, error } = extractTextAndThinking(
+          responseField[0].value as Uint8Array
+        );
+
+        if (error) {
+          return { text: null, error, toolCall: null, thinking: null };
+        }
 
         if (text || thinking) {
           return { text, error: null, toolCall: null, thinking };
@@ -328,7 +375,7 @@ export function extractTextFromResponse(payload: Uint8Array): {
     }
 
     if (payload.length > 0) {
-      return { text: null, error: 'Malformed protobuf response', toolCall: null, thinking: null };
+      return { text: null, error: null, toolCall: null, thinking: null };
     }
 
     return { text: null, error: null, toolCall: null, thinking: null };

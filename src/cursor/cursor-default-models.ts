@@ -62,6 +62,16 @@ export const DEFAULT_CURSOR_MODELS: CursorModel[] = [
 
   // Cursor Models
   {
+    id: 'composer-2.5',
+    name: 'Composer 2.5',
+    provider: 'cursor',
+  },
+  {
+    id: 'composer-2.5-fast',
+    name: 'Composer 2.5 Fast',
+    provider: 'cursor',
+  },
+  {
     id: 'composer-1.5',
     name: 'Composer 1.5',
     provider: 'cursor',

@@ -68,12 +68,15 @@ function toToolResultContent(content: unknown, label: string): string {
   return safeJsonStringify(content, TOOL_RESULT_SERIALIZATION_FALLBACK);
 }
 
-function mapAdaptiveEffortToCursorReasoningEffort(effort: string | undefined): string {
+function mapAdaptiveEffortToCursorReasoningEffort(effort: string | undefined): string | undefined {
   const normalized = effort?.trim().toLowerCase();
   if (!normalized || normalized === 'auto') {
-    return 'high';
+    return undefined;
   }
-  if (normalized === 'minimal' || normalized === 'low' || normalized === 'medium') {
+  if (normalized === 'minimal' || normalized === 'low') {
+    return 'medium';
+  }
+  if (normalized === 'medium') {
     return 'medium';
   }
   return 'high';

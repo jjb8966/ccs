@@ -1,0 +1,33 @@
+# CCS stack: dashboard + CLIProxy (Cursor via Plus backend)
+# Usage: from repo root — ./run-dev.sh
+
+services:
+  ccs:
+    image: ${CCS_IMAGE:-ghcr.io/kaitranntt/ccs:latest}
+    container_name: ccs
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    ports:
+      - "${CCS_CLIPROXY_PORT:-8317}:8317"
+      - "${CCS_DASHBOARD_PORT:-3000}:3000"
+      - "${CCS_CURSOR_DAEMON_PORT:-20129}:20129"
+    environment:
+      ANTHROPIC_AUTH_TOKEN: ${CCS_PROXY_TOKEN}
+      CCS_PROXY_TOKEN: ${CCS_PROXY_TOKEN}
+      CCS_CURSOR_FIRST_BYTE_TIMEOUT_MS: ${CCS_CURSOR_FIRST_BYTE_TIMEOUT_MS:-30000}
+      CCS_CURSOR_BIND_HOST: ${CCS_CURSOR_BIND_HOST:-0.0.0.0}
+    volumes:
+      - ./state/.ccs:/root/.ccs
+      - ccs_logs:/var/log/ccs
+      - ../dist/cursor:/usr/local/lib/node_modules/@kaitranntt/ccs/dist/cursor:ro
+    networks:
+      - default
+      - nginx-network
+
+volumes:
+  ccs_logs:
+
+networks:
+  nginx-network:
+    external: true

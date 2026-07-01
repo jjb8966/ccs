@@ -947,7 +947,7 @@ describe('CursorExecutor', () => {
       expect(headers).toHaveProperty('content-type', 'application/connect+proto');
       expect(headers).toHaveProperty('user-agent', 'connect-es/1.6.1');
       expect(headers).toHaveProperty('x-cursor-checksum');
-      expect(headers).toHaveProperty('x-cursor-client-version', '2.3.41');
+      expect(headers).toHaveProperty('x-cursor-client-version', '3.9.8');
       expect(headers).toHaveProperty('x-cursor-client-type', 'ide');
       expect(headers).toHaveProperty('x-ghost-mode', 'true');
     });
@@ -980,8 +980,8 @@ describe('CursorExecutor', () => {
 
       const headers = executor.buildHeaders(credentials);
 
-      expect(['windows', 'macos', 'linux']).toContain(headers['x-cursor-client-os']);
-      expect(['aarch64', 'x64']).toContain(headers['x-cursor-client-arch']);
+      expect(['win32', 'darwin', 'linux']).toContain(headers['x-cursor-client-os']);
+      expect(['arm64', 'x64']).toContain(headers['x-cursor-client-arch']);
       expect(typeof headers['x-cursor-timezone']).toBe('string');
       expect(headers['x-cursor-timezone'].length).toBeGreaterThan(0);
     });
@@ -1019,7 +1019,7 @@ describe('CursorExecutor', () => {
   describe('buildUrl', () => {
     it('should return correct API endpoint', () => {
       const url = executor.buildUrl();
-      expect(url).toBe('https://api2.cursor.sh/aiserver.v1.AiService/StreamChat');
+      expect(url).toBe('https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools');
     });
   });
 
@@ -1610,18 +1610,12 @@ describe('StreamingFrameParser', () => {
     }
   });
 
-  it('should classify malformed protobuf payload as server error', () => {
+  it('should ignore undecodable protobuf metadata frames without error', () => {
     const parser = new StreamingFrameParser();
     const malformedFrame = buildFrame(new Uint8Array([0xff, 0xff, 0xff]));
     const results = parser.push(malformedFrame);
 
-    expect(results.length).toBe(1);
-    expect(results[0].type).toBe('error');
-    if (results[0].type === 'error') {
-      expect(results[0].status).toBe(502);
-      expect(results[0].errorType).toBe('server_error');
-      expect(results[0].message).toContain('Malformed protobuf response');
-    }
+    expect(results.length).toBe(0);
   });
 
   it('should reject invalid gzip-compressed frames explicitly', () => {
