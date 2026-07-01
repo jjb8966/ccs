@@ -19,6 +19,7 @@ import { buildCursorConnectHeaders, generateCursorChecksum } from './cursor-clie
 import { createLogger } from '../services/logging';
 import {
   AssistantResponseStreamParser,
+  extractAvailableToolNames,
   extractRedactedToolCalls,
   type AssistantStreamEvent,
   remapCursorInternalToolCalls,
@@ -620,9 +621,7 @@ export class CursorExecutor {
             choices: [{ index: 0, delta, finish_reason: finishReason }],
           });
 
-        const availableToolNames = (requestBody.tools ?? [])
-          .map((tool) => tool.function?.name)
-          .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
+        const availableToolNames = extractAvailableToolNames(requestBody.tools);
 
         const emitRedactedToolCalls = (calls: ParsedOpenAIToolCall[]) => {
           const normalizedCalls = remapCursorInternalToolCalls(calls, availableToolNames);
@@ -1084,9 +1083,7 @@ export class CursorExecutor {
     }
 
     const combinedRaw = `${totalContent}${totalReasoning}`;
-    const availableToolNames = (body.tools ?? [])
-      .map((tool) => tool.function?.name)
-      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
+    const availableToolNames = extractAvailableToolNames(body.tools);
     const redacted = extractRedactedToolCalls(combinedRaw);
     if (redacted.toolCalls.length > 0) {
       for (const tc of remapCursorInternalToolCalls(redacted.toolCalls, availableToolNames)) {

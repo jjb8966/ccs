@@ -122,3 +122,75 @@ Use `feat:` or `fix:` for dev-to-main promotion PRs so release automation runs.
 - Execution remains CLI-first; dashboard should not replace terminal profile
   launch flows.
 - Error messages should help users recover, not just report failure.
+
+## Personal Fork Workflow
+
+This worktree is a **personal fork** of upstream CCS (`kaitranntt/ccs`), not the
+canonical contributor clone. Custom changes stay on the fork; upstream is synced
+only when explicitly needed.
+
+### Remotes
+
+```bash
+origin   -> https://github.com/jjb8966/ccs.git   # personal fork (push here)
+upstream -> https://github.com/kaitranntt/ccs.git # upstream OSS (fetch only)
+```
+
+One-time setup:
+
+```bash
+git remote set-url origin https://github.com/jjb8966/ccs.git
+git remote set-url upstream https://github.com/kaitranntt/ccs.git
+git remote -v
+```
+
+Do **not** point `origin` at `kaitranntt/ccs`; push permission is on the fork.
+
+### Commit
+
+- Commit on `dev` (or a feature branch) after local changes are ready.
+- Use Korean commit messages in this pattern:
+
+```text
+feat: (Cursor) <short summary>
+
+- bullet describing change
+- bullet describing change
+```
+
+- **Never commit** secrets or local-only state: `.env`, `backup/`,
+  `deploy/state/`.
+
+### Push to the fork
+
+Local Husky `.husky/pre-push` runs on **every** push (fork or upstream). For
+`dev`/`main` it runs the full CI parity gate (`validate:ci-parity`), which can
+take several minutes and is aimed at upstream PRs.
+
+For personal-fork-only custom work, skip the gate and push to `origin`:
+
+```bash
+CCS_SKIP_PREPUSH_GATE=1 git push -u origin dev
+```
+
+Equivalent: `git push -u origin dev --no-verify`.
+
+Only run the full gate when preparing an upstream PR:
+
+```bash
+bun run validate:ci-parity
+git push origin <feature-branch>
+```
+
+### Upstream sync (optional)
+
+Do not `git pull` from upstream unless you intend to merge upstream `dev`.
+When behind upstream, custom-only pushes do not require pulling first.
+
+```bash
+git fetch upstream
+git merge upstream/dev   # or: git rebase upstream/dev
+```
+
+Resolve conflicts, then push to the fork with `CCS_SKIP_PREPUSH_GATE=1` if
+using the personal-fork fast path above.

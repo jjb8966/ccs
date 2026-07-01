@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
-# CCS: docker + nginx-network
+# CCS: docker + nginx-network (+ optional ollama-proxy)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT}"
 
-if [[ ! -f "${ROOT}/.env" ]]; then
-  echo "[X] Create ${ROOT}/.env from .env.example and set CCS_PROXY_TOKEN." >&2
-  exit 1
-fi
-
-# shellcheck disable=SC1090
-set -a
-source "${ROOT}/.env"
-set +a
+# shellcheck source=scripts/deploy-common.sh
+source "${ROOT}/scripts/deploy-common.sh"
+deploy_load_ccs_env "${ROOT}"
 
 COMPOSE=(docker compose -f "${ROOT}/deploy/docker-compose.yml")
 CONTAINER="${CCS_CONTAINER_NAME:-ccs}"
@@ -50,20 +44,22 @@ fi
 echo "==> Installing CLIProxy Plus config in ccs..."
 "${COMPOSE[@]}" exec -T "${CONTAINER}" ccs cliproxy --backend plus 2>/dev/null || true
 
-echo "==> Starting native Cursor daemon (composer-2.5 path)..."
-"${COMPOSE[@]}" exec -T "${CONTAINER}" ccs legacy cursor enable 2>/dev/null || true
-"${COMPOSE[@]}" exec -T "${CONTAINER}" ccs legacy cursor auth --import-cliproxy 2>/dev/null || true
-"${COMPOSE[@]}" exec -T "${CONTAINER}" ccs legacy cursor start 2>/dev/null || true
+bash "${ROOT}/scripts/ensure-cursor-daemon.sh"
 
 echo "==> Connecting ${CONTAINER} to nginx-network..."
 docker network connect nginx-network "${CONTAINER}" 2>/dev/null \
   || echo "[!] Already on nginx-network or network missing (create: docker network create nginx-network)"
+
+bash "${ROOT}/scripts/ensure-ollama-proxy.sh" || {
+  echo "[!] ollama-proxy step failed — CCS cursor daemon may still work on :${CCS_CURSOR_DAEMON_PORT:-20129}"
+}
 
 echo "==> Reloading nginx..."
 docker exec nginx nginx -s reload 2>/dev/null \
   || echo "[!] nginx container not running — add deploy/nginx/ccs-proxy.conf and reload manually"
 
 PUBLIC_BASE="https://${CCS_PUBLIC_HOST:-jjb8966.duckdns.org}${CCS_PUBLIC_PATH:-/ccs}/api/provider/cursor"
+OLLAMA_PORT="${OLLAMA_PROXY_PORT:-5002}"
 
 echo ""
 echo "=============================================="
@@ -72,15 +68,23 @@ echo "  Dashboard:  http://127.0.0.1:${CCS_DASHBOARD_PORT:-3000}"
 echo "  CLIProxy:   http://127.0.0.1:${CCS_CLIPROXY_PORT:-8320}"
 echo "  Cursor:     http://127.0.0.1:${CCS_CURSOR_DAEMON_PORT:-20129}"
 echo "  Public URL: ${PUBLIC_BASE}"
-echo "  Bearer:     CCS_PROXY_TOKEN from .env"
+echo "  ollama-proxy: http://127.0.0.1:${OLLAMA_PORT} (PROXY_API_TOKEN = CCS_PROXY_TOKEN)"
+echo "  Bearer:     CCS_PROXY_TOKEN from .env (no quotes)"
 echo ""
 echo "Next (first time): ${ROOT}/cursor-auth.sh"
 echo "Claude Code: edit ~/agent/claude-code/settings.env.json yourself"
 echo "=============================================="
 
-# Optional health probe
 if curl -fsS "http://127.0.0.1:${CCS_CLIPROXY_PORT:-8320}/" >/dev/null; then
   echo "[OK] CLIProxy health check passed"
 else
   echo "[!] CLIProxy not reachable on :${CCS_CLIPROXY_PORT:-8320} — check: docker logs ${CONTAINER}"
+fi
+
+if curl -fsS -o /dev/null \
+  -H "Authorization: Bearer ${CCS_PROXY_TOKEN}" \
+  "http://127.0.0.1:${CCS_CURSOR_DAEMON_PORT:-20129}/v1/models"; then
+  echo "[OK] Cursor daemon health check passed"
+else
+  echo "[!] Cursor daemon not reachable — run: ${ROOT}/scripts/ensure-cursor-daemon.sh"
 fi

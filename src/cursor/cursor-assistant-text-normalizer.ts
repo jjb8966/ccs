@@ -31,6 +31,16 @@ function needsSpaceBetween(previous: string, next: string): boolean {
   );
 }
 
+const REDACTED_TOOL_MARKERS = [
+  '<｜tool▁calls▁begin｜>',
+  '<｜tool▁calls▁end｜>',
+  '<｜tool▁call▁begin｜>',
+  '<｜tool▁call▁end｜>',
+  '<｜tool▁sep｜>',
+];
+
+const BRACKET_TOOL_USE_PATTERN = /\[tool_use\s+([A-Za-z0-9_-]+)\s+(\{[\s\S]*?\})\]/g;
+
 export function stripControlMarkers(text: string): string {
   let normalized = text;
   for (const marker of [...FINAL_CONTENT_MARKERS, THINKING_END_MARKER]) {
@@ -39,12 +49,26 @@ export function stripControlMarkers(text: string): string {
   return normalized;
 }
 
+const REDACTED_THINKING_PATTERN = /<\/?redacted_thinking>/gi;
+
+/** Remove Cursor tool-call markup that leaked into visible assistant text. */
+export function stripLeakedToolMarkup(text: string): string {
+  let normalized = stripControlMarkers(text);
+  normalized = normalized.replace(REDACTED_THINKING_PATTERN, '');
+  for (const marker of REDACTED_TOOL_MARKERS) {
+    normalized = normalized.split(marker).join('');
+  }
+  normalized = normalized.replace(/<\|redacted[^>|]*[>|]?/gi, '');
+  normalized = normalized.replace(BRACKET_TOOL_USE_PATTERN, '');
+  return normalized;
+}
+
 export function normalizeAssistantVisibleText(text: string, previousChar = ''): string {
   if (!text) {
     return '';
   }
 
-  let normalized = stripControlMarkers(text);
+  let normalized = stripLeakedToolMarkup(text);
 
   if (needsSpaceBetween(previousChar, normalized)) {
     normalized = ` ${normalized}`;

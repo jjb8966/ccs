@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import {
   AssistantResponseStreamParser,
+  extractAvailableToolNames,
+  extractBracketToolUseCalls,
   extractRedactedToolCalls,
   parseRedactedToolBlock,
   remapCursorInternalToolCalls,
@@ -52,6 +54,40 @@ describe('cursor-redacted-tool-parser', () => {
     });
   });
 
+  it('remaps cursor internal tool names even when the available tool list is empty', () => {
+    const calls = remapCursorInternalToolCalls(parseRedactedToolBlock(SAMPLE_BLOCK), []);
+
+    expect(calls[0]?.function.name).toBe('Glob');
+    expect(calls[1]?.function.name).toBe('Read');
+  });
+
+  it('remaps cursor task tool calls to Claude Code Task', () => {
+    const block = `<｜tool▁call▁begin｜>
+task
+<｜tool▁sep｜>description
+Explore auth flow
+<｜tool▁sep｜>subagent_type
+generalPurpose
+<｜tool▁call▁end｜>`;
+    const [call] = remapCursorInternalToolCalls(parseRedactedToolBlock(block), ['Task']);
+
+    expect(call?.function.name).toBe('Task');
+    expect(JSON.parse(call?.function.arguments || '{}')).toEqual({
+      description: 'Explore auth flow',
+      prompt: 'Explore auth flow',
+      subagent_type: 'generalPurpose',
+    });
+  });
+
+  it('extracts available tool names from OpenAI and Anthropic tool shapes', () => {
+    expect(
+      extractAvailableToolNames([
+        { type: 'function', function: { name: 'Task' } },
+        { name: 'Bash', description: 'shell' },
+      ] as never)
+    ).toEqual(['Task', 'Bash']);
+  });
+
   it('extracts tool calls and strips markup from assistant text', () => {
     const raw =
       '조사합니다.\n<｜tool▁calls▁begin｜>' +
@@ -83,10 +119,55 @@ describe('cursor-redacted-tool-parser', () => {
     }
   });
 
-  it('passes through simple responses without thinking markers', () => {
-    const parser = new AssistantResponseStreamParser();
-    const events = [...parser.push('OK'), ...parser.finish()];
+  it('extracts bracket-style tool_use text into tool calls', () => {
+    const raw =
+      '검색합니다.\n[tool_use Bash {"command":"mysql -e \\"show tables\\"","description":"list tables"}]';
+    const parsed = extractRedactedToolCalls(raw);
 
-    expect(events).toEqual([{ kind: 'content', text: 'OK' }]);
+    expect(parsed.text).toBe('검색합니다.');
+    expect(parsed.toolCalls).toHaveLength(1);
+    expect(parsed.toolCalls[0]?.function.name).toBe('Bash');
+  });
+
+  it('strips leaked redacted tool markers from visible text', () => {
+    const raw = '요약입니다.\n<｜tool▁call▁end｜><｜tool▁calls▁end｜>';
+    const parsed = extractRedactedToolCalls(raw);
+    expect(parsed.text).toBe('요약입니다.');
+  });
+
+  it('uses toolu_ ids for parsed tool calls', () => {
+    const [call] = parseRedactedToolBlock(SAMPLE_BLOCK);
+    expect(call?.id).toMatch(/^toolu_cursor_/);
+  });
+
+  it('streams bracket tool_use text into tool_calls during visible content', () => {
+    const parser = new AssistantResponseStreamParser();
+    const events = [
+      ...parser.push('</think>\n\n검색합니다.\n'),
+      ...parser.push('[tool_use Bash {"command":"ls -la","description":"list files"}]'),
+      ...parser.finish(),
+    ];
+
+    const toolEvents = events.filter((event) => event.kind === 'tool_calls');
+    expect(toolEvents).toHaveLength(1);
+    if (toolEvents[0]?.kind === 'tool_calls') {
+      expect(toolEvents[0].toolCalls[0]?.function.name).toBe('Bash');
+      expect(toolEvents[0].toolCalls[0]?.id).toMatch(/^toolu_cursor_/);
+    }
+    expect(events.some((event) => event.kind === 'content' && event.text.includes('검색합니다'))).toBe(
+      true
+    );
+  });
+
+  it('remaps file_search to Grep', () => {
+    const raw =
+      '[tool_use file_search {"query":"sc_supply_chain_mapping","explanation":"find table"}]';
+    const [call] = remapCursorInternalToolCalls(extractBracketToolUseCalls(raw), ['Grep']);
+
+    expect(call?.function.name).toBe('Grep');
+    expect(JSON.parse(call?.function.arguments || '{}')).toEqual({
+      pattern: 'sc_supply_chain_mapping',
+      path: '.',
+    });
   });
 });
