@@ -170,4 +170,36 @@ generalPurpose
       path: '.',
     });
   });
+
+  it('remaps cursor internal tools to Hermes when read_file is registered', () => {
+    const calls = remapCursorInternalToolCalls(parseRedactedToolBlock(SAMPLE_BLOCK), [
+      'read_file',
+      'search_files',
+      'terminal',
+    ]);
+
+    expect(calls[0]?.function.name).toBe('search_files');
+    expect(JSON.parse(calls[0]?.function.arguments || '{}')).toEqual({
+      pattern: '*',
+      target: 'files',
+      path: '/Users/jbj/agent',
+    });
+    expect(calls[1]?.function.name).toBe('read_file');
+    expect(JSON.parse(calls[1]?.function.arguments || '{}')).toEqual({
+      path: '/Users/jbj/agent/prompts/AGENTS.md',
+    });
+  });
+
+  it('remaps bracket Bash to Hermes terminal', () => {
+    const raw = '[tool_use Bash {"command":"hermes cron list","description":"list jobs"}]';
+    const [call] = remapCursorInternalToolCalls(extractBracketToolUseCalls(raw), [
+      'terminal',
+      'read_file',
+    ]);
+
+    expect(call?.function.name).toBe('terminal');
+    expect(JSON.parse(call?.function.arguments || '{}')).toEqual({
+      command: 'hermes cron list',
+    });
+  });
 });

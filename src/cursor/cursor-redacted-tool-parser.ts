@@ -14,6 +14,7 @@ export const REDACTED_TOOL_CALL_END = '<｜tool▁call▁end｜>';
 import { FINAL_CONTENT_MARKERS, THINKING_END_MARKER } from './cursor-assistant-text-normalizer.js';
 export { THINKING_END_MARKER } from './cursor-assistant-text-normalizer.js';
 import { stripLeakedToolMarkup } from './cursor-assistant-text-normalizer.js';
+import { detectToolClientProfile, remapToolCallForProfile } from './cursor-tool-profile.js';
 
 const TOOL_SEP_PATTERN = /<\|redacted_tool_sep\|>|<｜tool[^｜|]*sep[^｜|]*｜>/gi;
 
@@ -66,182 +67,11 @@ export function extractAvailableToolNames(
     .filter((name): name is string => typeof name === 'string' && name.trim().length > 0);
 }
 
-const CURSOR_INTERNAL_TOOL_MAP: Record<
-  string,
-  {
-    name: string;
-    remapArgs: (args: Record<string, unknown>) => Record<string, unknown>;
-  }
-> = {
-  list_dir: {
-    name: 'Glob',
-    remapArgs: (args) => ({
-      target_directory: args.relative_workspace_path ?? args.target_directory ?? '.',
-      glob_pattern: args.glob_pattern ?? '*',
-    }),
-  },
-  read_file: {
-    name: 'Read',
-    remapArgs: (args) => {
-      const remapped: Record<string, unknown> = {};
-      const filePath = args.target_file ?? args.file_path ?? args.path;
-      if (filePath) {
-        remapped.file_path = filePath;
-      }
-      if (args.limit !== undefined) {
-        remapped.limit = args.limit;
-      }
-      if (args.offset !== undefined) {
-        remapped.offset = args.offset;
-      }
-      return remapped;
-    },
-  },
-  glob_file_search: {
-    name: 'Glob',
-    remapArgs: (args) => ({
-      target_directory: args.target_directory ?? args.relative_workspace_path ?? '.',
-      glob_pattern: args.glob_pattern ?? '**/*',
-    }),
-  },
-  run_terminal_cmd: {
-    name: 'Bash',
-    remapArgs: (args) => {
-      const remapped: Record<string, unknown> = {};
-      if (args.command) {
-        remapped.command = args.command;
-      }
-      const description = args.explanation ?? args.description;
-      if (description) {
-        remapped.description = description;
-      }
-      return remapped;
-    },
-  },
-  grep: {
-    name: 'Grep',
-    remapArgs: (args) => ({
-      pattern: args.pattern ?? args.query ?? args.search_term ?? '',
-      path: args.path ?? args.relative_workspace_path ?? '.',
-      glob: args.glob ?? args.glob_pattern,
-    }),
-  },
-  ripgrep_search: {
-    name: 'Grep',
-    remapArgs: (args) => ({
-      pattern: args.pattern ?? args.query ?? args.search_term ?? '',
-      path: args.path ?? args.relative_workspace_path ?? '.',
-      glob: args.glob ?? args.glob_pattern,
-    }),
-  },
-  codebase_search: {
-    name: 'Grep',
-    remapArgs: (args) => ({
-      pattern: args.query ?? args.pattern ?? args.search_term ?? '',
-      path: args.path ?? args.relative_workspace_path ?? '.',
-    }),
-  },
-  search_replace: {
-    name: 'Edit',
-    remapArgs: (args) => {
-      const remapped: Record<string, unknown> = {};
-      const filePath = args.file_path ?? args.target_file ?? args.path;
-      if (filePath) {
-        remapped.file_path = filePath;
-      }
-      if (args.old_string !== undefined) {
-        remapped.old_string = args.old_string;
-      }
-      if (args.new_string !== undefined) {
-        remapped.new_string = args.new_string;
-      }
-      if (args.replace_all !== undefined) {
-        remapped.replace_all = args.replace_all;
-      }
-      return remapped;
-    },
-  },
-  edit_file: {
-    name: 'Edit',
-    remapArgs: (args) => {
-      const remapped: Record<string, unknown> = {};
-      const filePath = args.file_path ?? args.target_file ?? args.path;
-      if (filePath) {
-        remapped.file_path = filePath;
-      }
-      if (args.old_string !== undefined) {
-        remapped.old_string = args.old_string;
-      }
-      if (args.new_string !== undefined) {
-        remapped.new_string = args.new_string;
-      }
-      return remapped;
-    },
-  },
-  write: {
-    name: 'Write',
-    remapArgs: (args) => {
-      const remapped: Record<string, unknown> = {};
-      const filePath = args.file_path ?? args.target_file ?? args.path;
-      if (filePath) {
-        remapped.file_path = filePath;
-      }
-      if (args.contents !== undefined) {
-        remapped.contents = args.contents;
-      } else if (args.content !== undefined) {
-        remapped.contents = args.content;
-      }
-      return remapped;
-    },
-  },
-  task: {
-    name: 'Task',
-    remapArgs: (args) => ({
-      description: args.description ?? args.prompt ?? '',
-      prompt: args.prompt ?? args.description ?? '',
-      subagent_type: args.subagent_type ?? args.agent_type ?? 'generalPurpose',
-      model: args.model,
-    }),
-  },
-  run_task: {
-    name: 'Task',
-    remapArgs: (args) => ({
-      description: args.description ?? args.prompt ?? '',
-      prompt: args.prompt ?? args.description ?? '',
-      subagent_type: args.subagent_type ?? args.agent_type ?? 'generalPurpose',
-      model: args.model,
-    }),
-  },
-  file_search: {
-    name: 'Grep',
-    remapArgs: (args) => ({
-      pattern: args.query ?? args.pattern ?? args.search_term ?? '',
-      path: args.path ?? args.target_directory ?? args.relative_workspace_path ?? '.',
-      glob: args.glob ?? args.glob_pattern,
-    }),
-  },
-  Agent: {
-    name: 'Task',
-    remapArgs: (args) => ({
-      description: args.description ?? args.prompt ?? '',
-      prompt: args.prompt ?? args.description ?? '',
-      subagent_type: args.subagent_type ?? 'generalPurpose',
-      model: args.model,
-    }),
-  },
-};
-
 export function remapCursorInternalToolCall(
   toolCall: ParsedOpenAIToolCall,
-  _availableTools?: Iterable<string>
+  availableTools?: Iterable<string>
 ): ParsedOpenAIToolCall {
-  const mapping = CURSOR_INTERNAL_TOOL_MAP[toolCall.function.name];
-  if (!mapping) {
-    return toolCall;
-  }
-
-  // Cursor internal names (list_dir, task, ...) are never valid Claude Code tools.
-  const targetName = mapping.name;
+  const profile = detectToolClientProfile(availableTools);
 
   let args: Record<string, unknown> = {};
   try {
@@ -250,11 +80,16 @@ export function remapCursorInternalToolCall(
     args = {};
   }
 
+  const remapped = remapToolCallForProfile(toolCall.function.name, args, profile);
+  if (!remapped) {
+    return toolCall;
+  }
+
   return {
     ...toolCall,
     function: {
-      name: targetName,
-      arguments: JSON.stringify(mapping.remapArgs(args)),
+      name: remapped.name,
+      arguments: JSON.stringify(remapped.args),
     },
   };
 }
