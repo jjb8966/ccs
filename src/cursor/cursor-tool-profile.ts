@@ -193,7 +193,7 @@ function remapWriteArgs(
     remapped.file_path = filePath;
   }
   if (content !== undefined) {
-    remapped.contents = content;
+    remapped.content = content;
   }
   return remapped;
 }
@@ -319,6 +319,20 @@ export function remapToolCallForProfile(
   const family = resolveToolFamily(toolName);
   if (!family) {
     return null;
+  }
+
+  const fullFileContent = args.contents ?? args.content;
+  if (
+    family === 'edit' &&
+    profile === 'claude_code' &&
+    fullFileContent !== undefined &&
+    args.old_string === undefined &&
+    args.new_string === undefined
+  ) {
+    return {
+      name: 'Write',
+      args: remapWriteArgs(args, profile),
+    };
   }
 
   return {

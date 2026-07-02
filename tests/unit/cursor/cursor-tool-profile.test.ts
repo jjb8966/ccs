@@ -60,4 +60,40 @@ describe('cursor-tool-profile', () => {
     expect(remapped?.name).toBe('terminal');
     expect(remapped?.args).toEqual({ command: 'ls -la' });
   });
+
+  it('maps cursor write tools to Claude Code Write with content param', () => {
+    const fromWriteFile = remapToolCallForProfile(
+      'write_file',
+      { target_file: '/tmp/a.java', contents: 'class A {}' },
+      'claude_code'
+    );
+    expect(fromWriteFile?.name).toBe('Write');
+    expect(fromWriteFile?.args).toEqual({
+      file_path: '/tmp/a.java',
+      content: 'class A {}',
+    });
+
+    const fromWrite = remapToolCallForProfile(
+      'Write',
+      { file_path: '/tmp/b.java', content: 'class B {}' },
+      'claude_code'
+    );
+    expect(fromWrite?.args).toEqual({
+      file_path: '/tmp/b.java',
+      content: 'class B {}',
+    });
+  });
+
+  it('maps cursor edit_file full-file writes to Claude Code Write', () => {
+    const remapped = remapToolCallForProfile(
+      'edit_file',
+      { target_file: '/tmp/NewDto.java', contents: 'package dto;' },
+      'claude_code'
+    );
+    expect(remapped?.name).toBe('Write');
+    expect(remapped?.args).toEqual({
+      file_path: '/tmp/NewDto.java',
+      content: 'package dto;',
+    });
+  });
 });
