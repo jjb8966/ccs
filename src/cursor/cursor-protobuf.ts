@@ -51,15 +51,13 @@ export function encodeRequest(
   }
 
   const hasTools = tools.length > 0;
-  const isAgentic = hasTools;
   const messageIds: MessageId[] = [];
   const messageFields: Uint8Array[] = [];
 
   for (const msg of messages) {
     const role = msg.role === 'user' ? ROLE.USER : ROLE.ASSISTANT;
     const msgId = randomUUID();
-    const chatModeEnum =
-      role === ROLE.USER ? (isAgentic ? UNIFIED_MODE.AGENT : UNIFIED_MODE.NORMAL) : undefined;
+    const chatModeEnum = role === ROLE.USER ? UNIFIED_MODE.AGENT : undefined;
 
     messageFields.push(
       encodeField(
@@ -91,11 +89,9 @@ export function encodeRequest(
     ? tools.map((tool) => encodeField(FIELD.Chat.MCP_TOOLS, WIRE_TYPE.LEN, encodeMcpTool(tool)))
     : [];
 
-  const supportedToolsFields = isAgentic
-    ? DEFAULT_SUPPORTED_CLIENT_TOOLS.map((toolId) =>
-        encodeField(FIELD.Chat.SUPPORTED_TOOLS, WIRE_TYPE.VARINT, toolId)
-      )
-    : [];
+  const supportedToolsFields = DEFAULT_SUPPORTED_CLIENT_TOOLS.map((toolId) =>
+    encodeField(FIELD.Chat.SUPPORTED_TOOLS, WIRE_TYPE.VARINT, toolId)
+  );
 
   const parts: Uint8Array[] = [
     ...messageFields,
@@ -109,17 +105,13 @@ export function encodeRequest(
     encodeField(FIELD.Chat.UNKNOWN_19, WIRE_TYPE.VARINT, 1),
     encodeField(FIELD.Chat.CONVERSATION_ID, WIRE_TYPE.LEN, randomUUID()),
     encodeField(FIELD.Chat.METADATA, WIRE_TYPE.LEN, encodeMetadata()),
-    encodeField(FIELD.Chat.IS_AGENTIC, WIRE_TYPE.VARINT, isAgentic ? 1 : 0),
+    encodeField(FIELD.Chat.IS_AGENTIC, WIRE_TYPE.VARINT, 1),
     ...supportedToolsFields,
     ...messageIdFields,
     ...toolFields,
     encodeField(FIELD.Chat.LARGE_CONTEXT, WIRE_TYPE.VARINT, 0),
     encodeField(FIELD.Chat.UNKNOWN_38, WIRE_TYPE.VARINT, 0),
-    encodeField(
-      FIELD.Chat.UNIFIED_MODE,
-      WIRE_TYPE.VARINT,
-      isAgentic ? UNIFIED_MODE.AGENT : UNIFIED_MODE.NORMAL
-    ),
+    encodeField(FIELD.Chat.UNIFIED_MODE, WIRE_TYPE.VARINT, UNIFIED_MODE.AGENT),
     encodeField(FIELD.Chat.UNKNOWN_47, WIRE_TYPE.LEN, ''),
     encodeField(FIELD.Chat.SHOULD_DISABLE_TOOLS, WIRE_TYPE.VARINT, 0),
     ...(thinkingLevel !== THINKING_LEVEL.UNSPECIFIED
@@ -127,7 +119,7 @@ export function encodeRequest(
       : [encodeField(FIELD.Chat.THINKING_LEVEL, WIRE_TYPE.VARINT, 0)]),
     encodeField(FIELD.Chat.UNKNOWN_51, WIRE_TYPE.VARINT, 0),
     encodeField(FIELD.Chat.UNKNOWN_53, WIRE_TYPE.VARINT, 1),
-    encodeField(FIELD.Chat.UNIFIED_MODE_NAME, WIRE_TYPE.LEN, isAgentic ? 'agent' : 'Ask'),
+    encodeField(FIELD.Chat.UNIFIED_MODE_NAME, WIRE_TYPE.LEN, 'agent'),
   ];
 
   return concatArrays(...parts);

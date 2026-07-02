@@ -19,7 +19,7 @@ import {
 import { buildCursorRequest } from '../../../src/cursor/cursor-translator';
 import { generateCursorBody } from '../../../src/cursor/cursor-protobuf';
 import { CursorExecutor } from '../../../src/cursor/cursor-executor';
-import { WIRE_TYPE, FIELD } from '../../../src/cursor/cursor-protobuf-schema';
+import { WIRE_TYPE, FIELD, UNIFIED_MODE } from '../../../src/cursor/cursor-protobuf-schema';
 import { StreamingFrameParser, decompressPayload } from '../../../src/cursor/cursor-stream-parser';
 
 const MAX_TOOL_RESULT_CHARS = 12_000;
@@ -820,6 +820,21 @@ describe('Request Encoding', () => {
       expect(decoder.decode(encodedMessages[0].get(FIELD.Message.CONTENT)?.[0]?.value as Uint8Array)).toBe(
         'Hello'
       );
+    });
+
+    it('should always encode agent mode even when no MCP tools are present', () => {
+      const result = generateCursorBody([{ role: 'user', content: 'Hello' }], 'composer-2.5', [], null);
+      const topLevel = decodeMessage(result);
+      const requestPayload = topLevel.get(FIELD.Request.REQUEST)?.[0]?.value as Uint8Array;
+      const chatRequest = decodeMessage(requestPayload);
+      const decoder = new TextDecoder();
+
+      expect(chatRequest.get(FIELD.Chat.IS_AGENTIC)?.[0]?.value).toBe(1);
+      expect(chatRequest.get(FIELD.Chat.UNIFIED_MODE)?.[0]?.value).toBe(UNIFIED_MODE.AGENT);
+      expect(
+        decoder.decode(chatRequest.get(FIELD.Chat.UNIFIED_MODE_NAME)?.[0]?.value as Uint8Array)
+      ).toBe('agent');
+      expect((chatRequest.get(FIELD.Chat.SUPPORTED_TOOLS) || []).length).toBeGreaterThan(0);
     });
 
     it('should encode image attachments on ConversationMessage field 10', () => {

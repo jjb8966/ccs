@@ -4,7 +4,9 @@ import {
   extractAvailableToolNames,
   extractBracketToolUseCalls,
   extractRedactedToolCalls,
+  extractToolCallResultCalls,
   parseRedactedToolBlock,
+  parseToolCallResultAttributes,
   remapCursorInternalToolCalls,
 } from '../../../src/cursor/cursor-redacted-tool-parser.js';
 
@@ -201,5 +203,70 @@ generalPurpose
     expect(JSON.parse(call?.function.arguments || '{}')).toEqual({
       command: 'hermes cron list',
     });
+  });
+
+  it('parses tool_call_result attribute blocks into tool calls', () => {
+    const raw =
+      '코드베이스와 DB 관련 문서를 검색합니다.\n' +
+      '[tool_call_result name="Bash" command="grep -r supply_stable_name /tmp/project 2>/dev/null | head -80" description="mapping search"]\n' +
+      '[tool_call_result name="Read" file_path="/tmp/project/docs/refactor.md" limit=200] ->';
+
+    const parsed = extractRedactedToolCalls(raw);
+    expect(parsed.text).toBe('코드베이스와 DB 관련 문서를 검색합니다.');
+    expect(parsed.toolCalls).toHaveLength(2);
+
+    const [bashCall, readCall] = remapCursorInternalToolCalls(parsed.toolCalls, ['Bash', 'Read']);
+    expect(bashCall?.function.name).toBe('Bash');
+    expect(JSON.parse(bashCall?.function.arguments || '{}')).toEqual({
+      command: 'grep -r supply_stable_name /tmp/project 2>/dev/null | head -80',
+      description: 'mapping search',
+    });
+    expect(readCall?.function.name).toBe('Read');
+    expect(JSON.parse(readCall?.function.arguments || '{}')).toEqual({
+      file_path: '/tmp/project/docs/refactor.md',
+      limit: 200,
+    });
+  });
+
+  it('parses tool_call_result attributes with escaped quotes', () => {
+    const parsed = parseToolCallResultAttributes(
+      'tool_call_result name="Bash" command="mysql -e \\"show tables\\"" description="list tables"'
+    );
+
+    expect(parsed).toEqual({
+      name: 'Bash',
+      args: {
+        command: 'mysql -e "show tables"',
+        description: 'list tables',
+      },
+    });
+  });
+
+  it('streams tool_call_result text into tool_calls during visible content', () => {
+    const parser = new AssistantResponseStreamParser();
+    const events = [
+      ...parser.push('</think>\n\n검색합니다.\n'),
+      ...parser.push(
+        '[tool_call_result name="Bash" command="ls -la" description="list files"]'
+      ),
+      ...parser.finish(),
+    ];
+
+    const toolEvents = events.filter((event) => event.kind === 'tool_calls');
+    expect(toolEvents).toHaveLength(1);
+    if (toolEvents[0]?.kind === 'tool_calls') {
+      expect(toolEvents[0].toolCalls[0]?.function.name).toBe('Bash');
+    }
+    expect(events.some((event) => event.kind === 'content' && event.text.includes('검색합니다'))).toBe(
+      true
+    );
+  });
+
+  it('extracts tool_call_result calls directly', () => {
+    const raw =
+      '[tool_call_result name="Grep" pattern="sc_supply_chain_mapping" path="."]';
+    const calls = extractToolCallResultCalls(raw);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.function.name).toBe('Grep');
   });
 });

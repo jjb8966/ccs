@@ -41,6 +41,8 @@ const REDACTED_TOOL_MARKERS = [
 
 const BRACKET_TOOL_USE_PATTERN = /\[tool_use\s+([A-Za-z0-9_-]+)\s+(\{[\s\S]*?\})\]/g;
 
+const TOOL_CALL_RESULT_PATTERN = /\[tool_call_result[^\]]*\](?:\s*->)?/g;
+
 export function stripControlMarkers(text: string): string {
   let normalized = text;
   for (const marker of [...FINAL_CONTENT_MARKERS, THINKING_END_MARKER]) {
@@ -60,6 +62,7 @@ export function stripLeakedToolMarkup(text: string): string {
   }
   normalized = normalized.replace(/<\|redacted[^>|]*[>|]?/gi, '');
   normalized = normalized.replace(BRACKET_TOOL_USE_PATTERN, '');
+  normalized = normalized.replace(TOOL_CALL_RESULT_PATTERN, '');
   return normalized;
 }
 

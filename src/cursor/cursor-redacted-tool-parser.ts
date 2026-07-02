@@ -20,6 +20,10 @@ const TOOL_SEP_PATTERN = /<\|redacted_tool_sep\|>|<｜tool[^｜|]*sep[^｜|]*｜
 
 const BRACKET_TOOL_USE_PATTERN = /\[tool_use\s+([A-Za-z0-9_-]+)\s+(\{[\s\S]*?\})\]/g;
 
+export const TOOL_CALL_RESULT_BEGIN = '[tool_call_result';
+
+const TOOL_CALL_RESULT_SUFFIX_PATTERN = /\s*->\s*/g;
+
 const PARTIAL_MARKER_PREFIXES = [
   ...FINAL_CONTENT_MARKERS,
   REDACTED_TOOL_CALLS_BEGIN,
@@ -35,6 +39,18 @@ const PARTIAL_MARKER_PREFIXES = [
 ];
 
 const BRACKET_TOOL_PARTIAL_PREFIXES = [
+  '[tool_call_result',
+  '[tool_call_resul',
+  '[tool_call_resu',
+  '[tool_call_res',
+  '[tool_call_re',
+  '[tool_call_r',
+  '[tool_call_',
+  '[tool_call',
+  '[tool_cal',
+  '[tool_ca',
+  '[tool_c',
+  '[tool_',
   '[tool_use',
   '[tool_us',
   '[tool_u',
@@ -108,9 +124,201 @@ export interface RedactedToolParseResult {
 
 let toolCallSequence = 0;
 
+function coerceArgValue(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  if (/^-?\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10);
+  if (/^-?\d+\.\d+$/.test(trimmed)) return Number.parseFloat(trimmed);
+  return trimmed;
+}
+
 function createToolCallId(index: number): string {
   toolCallSequence += 1;
   return `toolu_cursor_${Date.now()}_${index}_${toolCallSequence}`;
+}
+
+function findToolCallResultBlocks(
+  raw: string
+): Array<{ start: number; end: number; inner: string }> {
+  const blocks: Array<{ start: number; end: number; inner: string }> = [];
+  let searchFrom = 0;
+
+  while (searchFrom < raw.length) {
+    const begin = raw.indexOf(TOOL_CALL_RESULT_BEGIN, searchFrom);
+    if (begin === -1) {
+      break;
+    }
+
+    const bracketStart = begin;
+    let pos = begin + 1;
+    let inQuote = false;
+    let escaped = false;
+
+    while (pos < raw.length) {
+      const ch = raw[pos];
+      if (escaped) {
+        escaped = false;
+        pos += 1;
+        continue;
+      }
+      if (ch === '\\' && inQuote) {
+        escaped = true;
+        pos += 1;
+        continue;
+      }
+      if (ch === '"') {
+        inQuote = !inQuote;
+        pos += 1;
+        continue;
+      }
+      if (ch === ']' && !inQuote) {
+        blocks.push({
+          start: bracketStart,
+          end: pos + 1,
+          inner: raw.slice(bracketStart + 1, pos),
+        });
+        searchFrom = pos + 1;
+        break;
+      }
+      pos += 1;
+    }
+
+    if (pos >= raw.length) {
+      break;
+    }
+  }
+
+  return blocks;
+}
+
+export function parseToolCallResultAttributes(
+  inner: string
+): { name: string; args: Record<string, unknown> } | null {
+  const trimmed = inner.trim();
+  if (!trimmed.startsWith('tool_call_result')) {
+    return null;
+  }
+
+  let pos = 'tool_call_result'.length;
+  const args: Record<string, unknown> = {};
+  let name: string | undefined;
+
+  while (pos < trimmed.length) {
+    while (pos < trimmed.length && /\s/.test(trimmed[pos] ?? '')) {
+      pos += 1;
+    }
+    if (pos >= trimmed.length) {
+      break;
+    }
+
+    const keyStart = pos;
+    while (pos < trimmed.length && /[A-Za-z0-9_-]/.test(trimmed[pos] ?? '')) {
+      pos += 1;
+    }
+    const key = trimmed.slice(keyStart, pos);
+    if (!key) {
+      break;
+    }
+
+    while (pos < trimmed.length && /\s/.test(trimmed[pos] ?? '')) {
+      pos += 1;
+    }
+    if (trimmed[pos] !== '=') {
+      break;
+    }
+    pos += 1;
+    while (pos < trimmed.length && /\s/.test(trimmed[pos] ?? '')) {
+      pos += 1;
+    }
+
+    let value: unknown;
+    if (trimmed[pos] === '"') {
+      pos += 1;
+      let valueStr = '';
+      while (pos < trimmed.length) {
+        const ch = trimmed[pos];
+        if (ch === '\\' && pos + 1 < trimmed.length) {
+          valueStr += trimmed[pos + 1];
+          pos += 2;
+          continue;
+        }
+        if (ch === '"') {
+          pos += 1;
+          break;
+        }
+        valueStr += ch;
+        pos += 1;
+      }
+      value = valueStr;
+    } else {
+      const valueStart = pos;
+      while (pos < trimmed.length && !/\s/.test(trimmed[pos] ?? '')) {
+        pos += 1;
+      }
+      value = coerceArgValue(trimmed.slice(valueStart, pos));
+    }
+
+    if (key === 'name') {
+      name = String(value);
+    } else {
+      args[key] = value;
+    }
+  }
+
+  if (!name) {
+    return null;
+  }
+
+  return { name, args };
+}
+
+export function extractToolCallResultCallsWithRemainder(raw: string): {
+  toolCalls: ParsedOpenAIToolCall[];
+  remainder: string;
+} {
+  const blocks = findToolCallResultBlocks(raw);
+  if (blocks.length === 0) {
+    return { toolCalls: [], remainder: raw };
+  }
+
+  const toolCalls: ParsedOpenAIToolCall[] = [];
+  let remainder = raw;
+
+  for (const block of blocks) {
+    const parsed = parseToolCallResultAttributes(block.inner);
+    if (!parsed) {
+      continue;
+    }
+
+    toolCalls.push({
+      id: createToolCallId(toolCalls.length),
+      type: 'function',
+      function: {
+        name: parsed.name,
+        arguments: JSON.stringify(parsed.args),
+      },
+    });
+
+    let blockEnd = block.end;
+    const trailing = raw.slice(block.end);
+    const suffixMatch = trailing.match(/^\s*->/);
+    if (suffixMatch) {
+      blockEnd += suffixMatch[0].length;
+    }
+    remainder = remainder.replace(raw.slice(block.start, blockEnd), '');
+  }
+
+  return {
+    toolCalls,
+    remainder: stripLeakedToolMarkup(
+      remainder.replace(TOOL_CALL_RESULT_SUFFIX_PATTERN, ' ')
+    ).trim(),
+  };
+}
+
+export function extractToolCallResultCalls(raw: string): ParsedOpenAIToolCall[] {
+  return extractToolCallResultCallsWithRemainder(raw).toolCalls;
 }
 
 export function extractBracketToolUseCallsWithRemainder(raw: string): {
@@ -161,15 +369,6 @@ export function extractBracketToolUseCallsWithRemainder(raw: string): {
   }
 
   return { toolCalls, remainder: stripLeakedToolMarkup(remainder).trim() };
-}
-
-function coerceArgValue(raw: string): unknown {
-  const trimmed = raw.trim();
-  if (trimmed === 'true') return true;
-  if (trimmed === 'false') return false;
-  if (/^-?\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10);
-  if (/^-?\d+\.\d+$/.test(trimmed)) return Number.parseFloat(trimmed);
-  return trimmed;
 }
 
 function parseToolCallBody(body: string): { name: string; args: Record<string, unknown> } | null {
@@ -252,33 +451,42 @@ export function extractBracketToolUseCalls(raw: string): ParsedOpenAIToolCall[] 
   return extractBracketToolUseCallsWithRemainder(raw).toolCalls;
 }
 
+function mergeEmbeddedToolCalls(raw: string): { text: string; toolCalls: ParsedOpenAIToolCall[] } {
+  const toolCallResult = extractToolCallResultCallsWithRemainder(raw);
+  const bracket = extractBracketToolUseCallsWithRemainder(toolCallResult.remainder);
+  return {
+    text: stripLeakedToolMarkup(bracket.remainder).trim(),
+    toolCalls: [...toolCallResult.toolCalls, ...bracket.toolCalls],
+  };
+}
+
 export function extractRedactedToolCalls(raw: string): RedactedToolParseResult {
   const beginIndex = raw.indexOf(REDACTED_TOOL_CALLS_BEGIN);
   if (beginIndex === -1) {
+    const embedded = mergeEmbeddedToolCalls(raw);
     return {
-      text: stripLeakedToolMarkup(raw).trim(),
-      toolCalls: extractBracketToolUseCalls(raw),
+      text: embedded.text,
+      toolCalls: embedded.toolCalls,
     };
   }
 
   const endIndex = raw.indexOf(REDACTED_TOOL_CALLS_END, beginIndex);
   const prefix = raw.slice(0, beginIndex);
   if (endIndex === -1) {
+    const embedded = mergeEmbeddedToolCalls(raw);
     return {
       text: stripLeakedToolMarkup(prefix).trim(),
-      toolCalls: extractBracketToolUseCalls(raw),
+      toolCalls: embedded.toolCalls,
     };
   }
 
   const block = raw.slice(beginIndex + REDACTED_TOOL_CALLS_BEGIN.length, endIndex);
   const suffix = raw.slice(endIndex + REDACTED_TOOL_CALLS_END.length);
-  const toolCalls = [
-    ...parseRedactedToolBlock(block),
-    ...extractBracketToolUseCalls(`${prefix}${suffix}`),
-  ];
+  const embedded = mergeEmbeddedToolCalls(`${prefix}${suffix}`);
+  const toolCalls = [...parseRedactedToolBlock(block), ...embedded.toolCalls];
 
   return {
-    text: stripLeakedToolMarkup(`${prefix}${suffix}`).trim(),
+    text: embedded.text,
     toolCalls,
   };
 }
@@ -423,14 +631,35 @@ export class AssistantResponseStreamParser {
 
   private flushEmbeddedToolCallsFromPending(): AssistantStreamEvent[] {
     const events: AssistantStreamEvent[] = [];
-    const bracketIndex = this.pendingText.indexOf('[tool_use');
+    const toolUseIndex = this.pendingText.indexOf('[tool_use');
+    const toolCallResultIndex = this.pendingText.indexOf(TOOL_CALL_RESULT_BEGIN);
+    const bracketIndex =
+      toolUseIndex === -1
+        ? toolCallResultIndex
+        : toolCallResultIndex === -1
+          ? toolUseIndex
+          : Math.min(toolUseIndex, toolCallResultIndex);
+
     if (bracketIndex === -1) {
       return events;
     }
 
     const prefix = this.pendingText.slice(0, bracketIndex).trim();
     const suffix = this.pendingText.slice(bracketIndex);
-    const extracted = extractBracketToolUseCallsWithRemainder(suffix);
+    const extracted =
+      suffix.startsWith(TOOL_CALL_RESULT_BEGIN) ||
+      suffix.startsWith('[tool_call_resul') ||
+      suffix.startsWith('[tool_call_resu') ||
+      suffix.startsWith('[tool_call_res') ||
+      suffix.startsWith('[tool_call_re') ||
+      suffix.startsWith('[tool_call_r') ||
+      suffix.startsWith('[tool_call_') ||
+      suffix.startsWith('[tool_call') ||
+      suffix.startsWith('[tool_cal') ||
+      suffix.startsWith('[tool_ca') ||
+      suffix.startsWith('[tool_c')
+        ? extractToolCallResultCallsWithRemainder(suffix)
+        : extractBracketToolUseCallsWithRemainder(suffix);
     if (extracted.toolCalls.length === 0) {
       if (bracketIndex > 0) {
         const { flushed, remainder } = takeSafePrefix(this.pendingText);
