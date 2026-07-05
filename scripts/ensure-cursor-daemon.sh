@@ -36,11 +36,12 @@ if ! cursor_exec legacy cursor auth --import-cliproxy; then
   echo "[!] Cursor auth import failed — run ${ROOT}/cursor-auth.sh if needed"
 fi
 
-echo "==> Starting native Cursor daemon..."
-if ! cursor_exec legacy cursor start; then
-  echo "[!] cursor start failed — retrying once after cliproxy restart..."
-  docker exec "${CONTAINER}" supervisorctl -c /etc/supervisord.conf restart cliproxy 2>/dev/null || true
-  sleep 3
+echo "==> Ensuring native Cursor daemon is running..."
+if docker exec "${CONTAINER}" sh -lc "nc -z 127.0.0.1 '${CURSOR_PORT}'" 2>/dev/null; then
+  echo "[OK] Cursor daemon already listening on :${CURSOR_PORT}"
+elif docker exec "${CONTAINER}" supervisorctl -c /etc/supervisord.conf status cursor-daemon 2>/dev/null | grep -q RUNNING; then
+  echo "[OK] Cursor daemon is managed by supervisord"
+else
   cursor_exec legacy cursor start
 fi
 

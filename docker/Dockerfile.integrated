@@ -43,6 +43,6 @@ COPY entrypoint-integrated.sh /entrypoint-integrated.sh
 RUN chmod +x /entrypoint-integrated.sh \
   && mkdir -p /var/log/ccs
 
-EXPOSE 3000 8085 8317
+EXPOSE 3000 8085 8317 20129
 
 ENTRYPOINT ["/entrypoint-integrated.sh"]

@@ -25,7 +25,7 @@ echo "==> Ensuring ccs embedded cliproxy (Plus backend for Cursor)..."
 bash "${ROOT}/scripts/ensure-plus-binary.sh" || true
 
 echo "==> Starting ${CONTAINER}..."
-"${COMPOSE[@]}" up -d --force-recreate
+"${COMPOSE[@]}" up -d --force-recreate --build
 
 echo "==> Waiting for ccs cliproxy..."
 for _ in $(seq 1 30); do

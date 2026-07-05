@@ -3,7 +3,12 @@
 
 services:
   ccs:
-    image: ${CCS_IMAGE:-ghcr.io/kaitranntt/ccs:latest}
+    image: ${CCS_IMAGE:-ccs-local:cursor-supervisor}
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.integrated
+      args:
+        CCS_NPM_VERSION: ${CCS_NPM_VERSION:-latest}
     container_name: ccs
     restart: unless-stopped
     env_file:
@@ -21,6 +26,15 @@ services:
       - ./state/.ccs:/root/.ccs
       - ccs_logs:/var/log/ccs
       - ../dist/cursor:/usr/local/lib/node_modules/@kaitranntt/ccs/dist/cursor:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "const net=require('net'); const ports=[3000,8317,20129]; let pending=ports.length; let ok=true; for (const port of ports) { const socket=net.connect(port,'127.0.0.1',()=>done(true)); socket.setTimeout(2500,()=>done(false)); socket.on('error',()=>done(false)); function done(result){ if (socket.destroyed) return; ok = ok && result; socket.destroy(); if (--pending === 0) process.exit(ok ? 0 : 1); } } setTimeout(()=>process.exit(1),3000);"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     networks:
       - default
       - nginx-network
