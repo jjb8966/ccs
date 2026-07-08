@@ -24,6 +24,9 @@ docker rm -f ccs-dev ccs-dashboard 2>/dev/null || true
 echo "==> Ensuring ccs embedded cliproxy (Plus backend for Cursor)..."
 bash "${ROOT}/scripts/ensure-plus-binary.sh" || true
 
+echo "==> Ensuring dist/cursor overlay (required before container start)..."
+bash "${ROOT}/scripts/ensure-cursor-dist.sh"
+
 echo "==> Starting ${CONTAINER}..."
 "${COMPOSE[@]}" up -d --force-recreate --build
 

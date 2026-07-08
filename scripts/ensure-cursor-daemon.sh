@@ -21,12 +21,7 @@ if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
   exit 1
 fi
 
-if command -v bun >/dev/null 2>&1; then
-  echo "==> Building dist/cursor overlay..."
-  (cd "${ROOT}" && bun run build)
-else
-  echo "[!] bun not found — using existing dist/cursor overlay"
-fi
+bash "${ROOT}/scripts/ensure-cursor-dist.sh"
 
 echo "==> Enabling native Cursor daemon..."
 cursor_exec legacy cursor enable
@@ -45,12 +40,29 @@ else
   cursor_exec legacy cursor start
 fi
 
+cursor_daemon_http_code() {
+  curl -sS -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer ${CCS_PROXY_TOKEN}" \
+    "http://127.0.0.1:${CURSOR_PORT}/v1/models" 2>/dev/null || echo "000"
+}
+
+cursor_daemon_listening() {
+  docker exec "${CONTAINER}" sh -lc "nc -z 127.0.0.1 '${CURSOR_PORT}'" 2>/dev/null
+}
+
 echo "==> Waiting for Cursor daemon on :${CURSOR_PORT}..."
 for _ in $(seq 1 45); do
-  if curl -fsS -o /dev/null \
-    -H "Authorization: Bearer ${CCS_PROXY_TOKEN}" \
-    "http://127.0.0.1:${CURSOR_PORT}/v1/models" 2>/dev/null; then
+  code="$(cursor_daemon_http_code)"
+  if [[ "${code}" == "200" ]]; then
     echo "[OK] Cursor daemon ready on :${CURSOR_PORT}"
+    exit 0
+  fi
+  if [[ "${code}" == "401" ]]; then
+    echo "[!] Cursor daemon listening but not authenticated — run ${ROOT}/cursor-auth.sh"
+    exit 0
+  fi
+  if cursor_daemon_listening; then
+    echo "[!] Cursor daemon listening on :${CURSOR_PORT} (auth pending) — run ${ROOT}/cursor-auth.sh"
     exit 0
   fi
   sleep 1
