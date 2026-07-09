@@ -677,6 +677,19 @@ export class CursorExecutor {
               continue;
             }
 
+            if (event.kind === 'reasoning') {
+              if (!event.text) {
+                continue;
+              }
+              const delta =
+                chunkCount === 0 && toolCallCount === 0
+                  ? { role: 'assistant', reasoning_content: event.text }
+                  : { reasoning_content: event.text };
+              emitSSE(buildChunk(delta, null));
+              chunkCount++;
+              continue;
+            }
+
             const visibleText = textNormalizer.push(event.text);
             if (!visibleText) {
               continue;
@@ -816,8 +829,20 @@ export class CursorExecutor {
               handleAssistantEvents(assistantParser.push(frame.text));
             }
 
+            // Thinking frames must emit immediately as reasoning_content.
+            // Do NOT feed them into AssistantResponseStreamParser: that parser
+            // buffers until </think> and would silence SSE for the entire
+            // thinking phase (Hermes/OpenAI clients hit stream-stale timeouts).
             if (frame.type === 'thinking') {
-              handleAssistantEvents(assistantParser.push(frame.text));
+              if (!frame.text) {
+                continue;
+              }
+              const delta =
+                chunkCount === 0 && toolCallCount === 0
+                  ? { role: 'assistant', reasoning_content: frame.text }
+                  : { reasoning_content: frame.text };
+              emitSSE(buildChunk(delta, null));
+              chunkCount++;
             }
           }
         });

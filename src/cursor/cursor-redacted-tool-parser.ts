@@ -11,8 +11,12 @@ export const REDACTED_TOOL_CALLS_BEGIN = '<｜tool▁calls▁begin｜>';
 export const REDACTED_TOOL_CALLS_END = '<｜tool▁calls▁end｜>';
 export const REDACTED_TOOL_CALL_BEGIN = '<｜tool▁call▁begin｜>';
 export const REDACTED_TOOL_CALL_END = '<｜tool▁call▁end｜>';
-import { FINAL_CONTENT_MARKERS, THINKING_END_MARKER } from './cursor-assistant-text-normalizer.js';
-export { THINKING_END_MARKER } from './cursor-assistant-text-normalizer.js';
+import {
+  FINAL_CONTENT_MARKERS,
+  THINKING_END_MARKER,
+  THINKING_START_MARKER,
+} from './cursor-assistant-text-normalizer.js';
+export { THINKING_END_MARKER, THINKING_START_MARKER } from './cursor-assistant-text-normalizer.js';
 import { stripLeakedToolMarkup } from './cursor-assistant-text-normalizer.js';
 import { detectToolClientProfile, remapToolCallForProfile } from './cursor-tool-profile.js';
 
@@ -493,7 +497,27 @@ export function extractRedactedToolCalls(raw: string): RedactedToolParseResult {
 
 export type AssistantStreamEvent =
   | { kind: 'content'; text: string }
+  | { kind: 'reasoning'; text: string }
   | { kind: 'tool_calls'; toolCalls: ParsedOpenAIToolCall[] };
+
+function takeSafeMarkerPrefix(
+  buffer: string,
+  markers: string[]
+): { flushed: string; remainder: string } {
+  let safeLength = buffer.length;
+  for (const marker of markers) {
+    for (let size = marker.length - 1; size > 0; size -= 1) {
+      const prefix = marker.slice(0, size);
+      if (buffer.endsWith(prefix)) {
+        safeLength = Math.min(safeLength, buffer.length - size);
+      }
+    }
+  }
+  return {
+    flushed: buffer.slice(0, safeLength),
+    remainder: buffer.slice(safeLength),
+  };
+}
 
 function takeSafePrefix(buffer: string): { flushed: string; remainder: string } {
   let safeLength = buffer.length;
@@ -518,6 +542,7 @@ function takeSafePrefix(buffer: string): { flushed: string; remainder: string } 
 export class AssistantResponseStreamParser {
   private preThinkingBuffer = '';
   private pastThinking = false;
+  private seenThinkingStart = false;
   private preFinalBuffer = '';
   private pastFinal = false;
   private pendingText = '';
@@ -531,16 +556,7 @@ export class AssistantResponseStreamParser {
     }
 
     if (!this.pastThinking) {
-      this.preThinkingBuffer += delta;
-      const markerIndex = this.preThinkingBuffer.indexOf(THINKING_END_MARKER);
-      if (markerIndex === -1) {
-        return [];
-      }
-
-      this.pastThinking = true;
-      const remainder = this.preThinkingBuffer.slice(markerIndex + THINKING_END_MARKER.length);
-      this.preThinkingBuffer = '';
-      return this.pushPostThinking(remainder);
+      return this.pushPreThinking(delta);
     }
 
     return this.pushPostThinking(delta);
@@ -552,11 +568,25 @@ export class AssistantResponseStreamParser {
     if (!this.pastThinking && this.preThinkingBuffer) {
       const markerIndex = this.preThinkingBuffer.indexOf(THINKING_END_MARKER);
       if (markerIndex !== -1) {
-        this.pastThinking = true;
+        const reasoning = this.preThinkingBuffer.slice(0, markerIndex);
         const remainder = this.preThinkingBuffer.slice(markerIndex + THINKING_END_MARKER.length);
         this.preThinkingBuffer = '';
+        this.pastThinking = true;
+        if (reasoning) {
+          events.push({ kind: 'reasoning', text: reasoning });
+        }
         events.push(...this.pushPostThinking(remainder));
+      } else if (this.seenThinkingStart) {
+        // Unclosed thinking block: flush remaining as reasoning.
+        const reasoning = this.preThinkingBuffer;
+        this.preThinkingBuffer = '';
+        this.pastThinking = true;
+        this.pastFinal = true;
+        if (reasoning) {
+          events.push({ kind: 'reasoning', text: reasoning });
+        }
       } else {
+        // No thinking markers at all — treat as normal content.
         this.pastThinking = true;
         this.pastFinal = true;
         const remainder = this.preThinkingBuffer;
@@ -565,11 +595,13 @@ export class AssistantResponseStreamParser {
       }
     }
 
-    if (!this.pastFinal && this.preFinalBuffer.trim()) {
+    if (!this.pastFinal && this.preFinalBuffer) {
       this.pastFinal = true;
       const remainder = this.preFinalBuffer;
       this.preFinalBuffer = '';
-      events.push(...this.pushVisibleContent(remainder));
+      if (remainder) {
+        events.push(...this.pushVisibleContent(remainder));
+      }
     }
 
     if (this.inToolBlock && this.toolBlockBuffer.trim()) {
@@ -600,6 +632,62 @@ export class AssistantResponseStreamParser {
     return this.emittedToolCalls.length;
   }
 
+  private pushPreThinking(delta: string): AssistantStreamEvent[] {
+    this.preThinkingBuffer += delta;
+    const events: AssistantStreamEvent[] = [];
+
+    if (!this.seenThinkingStart) {
+      const startIndex = this.preThinkingBuffer.indexOf(THINKING_START_MARKER);
+      if (startIndex === -1) {
+        // Legacy path: some streams omit <think> and only send ...</think>.
+        // Keep buffering until </think> (or finish()) so we do not leak thinking
+        // into content, but flush reasoning progressively once we know we are
+        // inside an unterminated thinking block without a start marker.
+        const endIndex = this.preThinkingBuffer.indexOf(THINKING_END_MARKER);
+        if (endIndex === -1) {
+          return events;
+        }
+        const reasoning = this.preThinkingBuffer.slice(0, endIndex);
+        const remainder = this.preThinkingBuffer.slice(endIndex + THINKING_END_MARKER.length);
+        this.preThinkingBuffer = '';
+        this.pastThinking = true;
+        if (reasoning) {
+          events.push({ kind: 'reasoning', text: reasoning });
+        }
+        events.push(...this.pushPostThinking(remainder));
+        return events;
+      }
+
+      this.seenThinkingStart = true;
+      // Drop any preamble before <think> (usually empty) and the start marker.
+      this.preThinkingBuffer = this.preThinkingBuffer.slice(
+        startIndex + THINKING_START_MARKER.length
+      );
+    }
+
+    const endIndex = this.preThinkingBuffer.indexOf(THINKING_END_MARKER);
+    if (endIndex === -1) {
+      const { flushed, remainder } = takeSafeMarkerPrefix(this.preThinkingBuffer, [
+        THINKING_END_MARKER,
+      ]);
+      this.preThinkingBuffer = remainder;
+      if (flushed) {
+        events.push({ kind: 'reasoning', text: flushed });
+      }
+      return events;
+    }
+
+    const reasoning = this.preThinkingBuffer.slice(0, endIndex);
+    const remainder = this.preThinkingBuffer.slice(endIndex + THINKING_END_MARKER.length);
+    this.preThinkingBuffer = '';
+    this.pastThinking = true;
+    if (reasoning) {
+      events.push({ kind: 'reasoning', text: reasoning });
+    }
+    events.push(...this.pushPostThinking(remainder));
+    return events;
+  }
+
   private pushPostThinking(delta: string): AssistantStreamEvent[] {
     if (!this.pastFinal) {
       this.preFinalBuffer += delta;
@@ -613,17 +701,31 @@ export class AssistantResponseStreamParser {
         }
       }
 
-      if (markerIndex === -1) {
-        return [];
+      if (markerIndex !== -1) {
+        this.pastFinal = true;
+        // Discard anything before the final marker (control/preamble), then stream
+        // the remainder as visible content.
+        const remainder = this.preFinalBuffer.slice(markerIndex + markerLength);
+        this.preFinalBuffer = '';
+        if (!remainder) {
+          return [];
+        }
+        return this.pushVisibleContent(remainder);
       }
 
-      this.pastFinal = true;
-      const remainder = this.preFinalBuffer.slice(markerIndex + markerLength);
-      this.preFinalBuffer = '';
-      if (!remainder) {
+      // Many models (e.g. grok-4.5) omit <|final|> and emit answer text directly
+      // after </think>. Stream that text live instead of buffering until finish().
+      const { flushed, remainder } = takeSafeMarkerPrefix(this.preFinalBuffer, [
+        ...FINAL_CONTENT_MARKERS,
+      ]);
+      this.preFinalBuffer = remainder;
+      if (!flushed) {
         return [];
       }
-      return this.pushVisibleContent(remainder);
+      // Once we start emitting post-thinking content without a final marker,
+      // treat subsequent text as visible content (pastFinal).
+      this.pastFinal = true;
+      return this.pushVisibleContent(flushed);
     }
 
     return this.pushVisibleContent(delta);

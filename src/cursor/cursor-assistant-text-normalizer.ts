@@ -1,3 +1,4 @@
+export const THINKING_START_MARKER = '<think>';
 export const THINKING_END_MARKER = '</think>';
 
 export const FINAL_CONTENT_MARKERS = ['<｜final｜>', '<|final|>'];
@@ -45,7 +46,7 @@ const TOOL_CALL_RESULT_PATTERN = /\[tool_call_result[^\]]*\](?:\s*->)?/g;
 
 export function stripControlMarkers(text: string): string {
   let normalized = text;
-  for (const marker of [...FINAL_CONTENT_MARKERS, THINKING_END_MARKER]) {
+  for (const marker of [...FINAL_CONTENT_MARKERS, THINKING_START_MARKER, THINKING_END_MARKER]) {
     normalized = normalized.split(marker).join('');
   }
   return normalized;

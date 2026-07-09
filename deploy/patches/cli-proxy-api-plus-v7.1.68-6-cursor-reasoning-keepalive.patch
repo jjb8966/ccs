@@ -1,0 +1,784 @@
+diff --git a/internal/auth/cursor/proto/decode.go b/internal/auth/cursor/proto/decode.go
+index f54fc735..b212a27c 100644
+--- a/internal/auth/cursor/proto/decode.go
++++ b/internal/auth/cursor/proto/decode.go
+@@ -36,6 +36,7 @@ const (
+ 	ServerMsgHeartbeat                             // Server heartbeat
+ 	ServerMsgTokenDelta                            // Token usage delta
+ 	ServerMsgCheckpoint                            // Conversation checkpoint update
++	ServerMsgInteractionQuery                      // Server asks client to approve web search / etc.
+ )
+ 
+ // DecodedServerMessage holds parsed data from an AgentServerMessage.
+@@ -67,6 +68,13 @@ type DecodedServerMessage struct {
+ 
+ 	// For other exec - the raw field number for building a response
+ 	ExecFieldNumber int
++	// Raw bytes of the unknown exec oneof payload (e.g. field 28 search args)
++	ExecRawArgs []byte
++
++	// For InteractionQuery (ASM field 7) — client must reply with InteractionResponse
++	InteractionQueryID   uint32
++	InteractionQueryKind int // IQ field number: 2=web_search, 3=ask_question, 5=exa_search, ...
++	InteractionQueryTerm string
+ 
+ 	// For TokenDeltaUpdate
+ 	TokenDelta int64
+@@ -111,6 +119,9 @@ func DecodeAgentServerMessage(data []byte) (*DecodedServerMessage, error) {
+ 				msg.Type = ServerMsgCheckpoint
+ 				msg.CheckpointData = append([]byte(nil), val...) // copy raw bytes
+ 				log.Debugf("DecodeAgentServerMessage: captured checkpoint %d bytes", len(val))
++			case ASM_InteractionQuery:
++				log.Debugf("DecodeAgentServerMessage: calling decodeInteractionQuery")
++				decodeInteractionQuery(val, msg)
+ 			}
+ 
+ 		case protowire.VarintType:
+@@ -202,6 +213,120 @@ func decodeInteractionUpdate(data []byte, msg *DecodedServerMessage) {
+ 	}
+ }
+ 
++// decodeInteractionQuery parses ASM field 7 (InteractionQuery). Cursor sends this
++// when the model wants built-in web/exa search; the client must reply with
++// AgentClientMessage.interaction_response or the stream hangs forever.
++func decodeInteractionQuery(data []byte, msg *DecodedServerMessage) {
++	msg.Type = ServerMsgInteractionQuery
++	for len(data) > 0 {
++		num, typ, n := protowire.ConsumeTag(data)
++		if n < 0 {
++			return
++		}
++		data = data[n:]
++		switch typ {
++		case protowire.VarintType:
++			val, n := protowire.ConsumeVarint(data)
++			if n < 0 {
++				return
++			}
++			data = data[n:]
++			if num == 1 { // id is uint32
++				msg.InteractionQueryID = uint32(val)
++			}
++		case protowire.BytesType:
++			val, n := protowire.ConsumeBytes(data)
++			if n < 0 {
++				return
++			}
++			data = data[n:]
++			switch {
++			case num >= 2 && num <= 8: // web_search / ask_question / switch_mode / exa_* / create_plan / setup_vm
++				msg.InteractionQueryKind = int(num)
++				extractInteractionQueryArgs(val, msg)
++			case num >= 9: // newer Cursor InteractionQuery oneofs — capture kind, reject later
++				msg.InteractionQueryKind = int(num)
++				extractInteractionQueryArgs(val, msg)
++				log.Debugf("decodeInteractionQuery: newer bytes field %d len=%d (will reject if unsupported)", num, len(val))
++			default:
++				log.Debugf("decodeInteractionQuery: unknown bytes field %d len=%d", num, len(val))
++			}
++		default:
++			n := protowire.ConsumeFieldValue(num, typ, data)
++			if n < 0 {
++				return
++			}
++			data = data[n:]
++		}
++	}
++	log.Debugf("decodeInteractionQuery: id=%d kind=%d term=%q", msg.InteractionQueryID, msg.InteractionQueryKind, msg.InteractionQueryTerm)
++}
++
++func extractInteractionQueryArgs(data []byte, msg *DecodedServerMessage) {
++	for len(data) > 0 {
++		num, typ, n := protowire.ConsumeTag(data)
++		if n < 0 {
++			return
++		}
++		data = data[n:]
++		if typ != protowire.BytesType {
++			n = protowire.ConsumeFieldValue(num, typ, data)
++			if n < 0 {
++				return
++			}
++			data = data[n:]
++			continue
++		}
++		val, n := protowire.ConsumeBytes(data)
++		if n < 0 {
++			return
++		}
++		data = data[n:]
++		if num == 1 { // args wrapper or direct string
++			// Try nested args first
++			nestedTerm := ""
++			nestedID := ""
++			rest := val
++			for len(rest) > 0 {
++				nnum, ntyp, nn := protowire.ConsumeTag(rest)
++				if nn < 0 {
++					break
++				}
++				rest = rest[nn:]
++				if ntyp != protowire.BytesType {
++					nn = protowire.ConsumeFieldValue(nnum, ntyp, rest)
++					if nn < 0 {
++						break
++					}
++					rest = rest[nn:]
++					continue
++				}
++				nval, nn := protowire.ConsumeBytes(rest)
++				if nn < 0 {
++					break
++				}
++				rest = rest[nn:]
++				switch nnum {
++				case 1: // search_term / query
++					nestedTerm = string(nval)
++				case 2: // tool_call_id
++					nestedID = string(nval)
++				}
++			}
++			if nestedTerm != "" {
++				msg.InteractionQueryTerm = nestedTerm
++			} else if msg.InteractionQueryTerm == "" {
++				msg.InteractionQueryTerm = string(val)
++			}
++			if nestedID != "" && msg.McpToolCallId == "" {
++				msg.McpToolCallId = nestedID
++			}
++		} else if num == 2 && msg.McpToolCallId == "" {
++			msg.McpToolCallId = string(val)
++		}
++	}
++}
++
+ func decodeKvServerMessage(data []byte, msg *DecodedServerMessage) {
+ 	for len(data) > 0 {
+ 		num, typ, n := protowire.ConsumeTag(data)
+@@ -346,12 +471,25 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
+ 				decodeShellArgs(val, msg) // same structure
+ 			case ESM_WriteShellStdinArgs:
+ 				msg.Type = ServerMsgExecWriteShellStdin
++			case ESM_ListMcpResourcesArgs, ESM_ReadMcpResourceArgs, ESM_RecordScreenArgs, ESM_ComputerUseArgs:
++				// Known newer tools: treat as ExecOther so the executor can reject
++				// with the correct field number (descriptor may lack encode helpers).
++				msg.Type = ServerMsgExecOther
++				msg.ExecFieldNumber = int(num)
++				msg.ExecRawArgs = append([]byte(nil), val...)
++			case ESM_SpanContext:
++				// Metadata only — never classify as a tool that needs a result.
++				log.Debugf("decodeExecServerMessage: span_context (ignored)")
+ 			default:
+-				// Unknown exec types - only set if we haven't identified the type yet
+-				// (other fields like span_context (19) come after the exec type field)
+-				if msg.Type == ServerMsgUnknown {
++				// Unknown exec oneof members (e.g. field 28 built-in web/docs search).
++				// Span_context (19) often appears in the same message BEFORE the real
++				// tool field; always prefer a later unknown tool field over an earlier
++				// ExecOther misclassification.
++				if msg.Type == ServerMsgUnknown || msg.Type == ServerMsgExecOther {
+ 					msg.Type = ServerMsgExecOther
+ 					msg.ExecFieldNumber = int(num)
++					msg.ExecRawArgs = append([]byte(nil), val...)
++					log.Debugf("decodeExecServerMessage: unknown exec field=%d -> ExecOther", num)
+ 				}
+ 			}
+ 
+diff --git a/internal/auth/cursor/proto/encode.go b/internal/auth/cursor/proto/encode.go
+index b1be6551..c3c47f50 100644
+--- a/internal/auth/cursor/proto/encode.go
++++ b/internal/auth/cursor/proto/encode.go
+@@ -585,6 +585,108 @@ func EncodeExecWriteShellStdinError(execMsgId uint32, execId string, errMsg stri
+ 	return encodeExecClientMsg(execMsgId, execId, "write_shell_stdin_result", result)
+ }
+ 
++// EncodeExecUnknownRejected responds to ExecServerMessage oneof fields that are
++// missing from the embedded agent.proto descriptor (e.g. field 28 = Cursor
++// built-in web/docs search). Without a reply the H2 session waits forever and
++// OpenAI clients see a hang after the model announces it will "check".
++//
++// Wire format mirrors common Cursor tool results: field N { error { error } }.
++func EncodeExecUnknownRejected(execMsgId uint32, execId string, fieldNumber int, reason string) []byte {
++	if fieldNumber <= 0 {
++		fieldNumber = 28
++	}
++	if reason == "" {
++		reason = "Tool not available in this environment."
++	}
++
++	// Prefer error=2 (FetchResult/WebSearchResult shape). Field 28 may not have
++	// rejected=3 in the live schema.
++	errInner := protowire.AppendTag(nil, 1, protowire.BytesType)
++	errInner = protowire.AppendString(errInner, reason)
++	result := protowire.AppendTag(nil, 2, protowire.BytesType)
++	result = protowire.AppendBytes(result, errInner)
++
++	return encodeRawExecClientMsg(execMsgId, execId, fieldNumber, result)
++}
++
++// EncodeExecUnknownSuccess replies to an unknown exec field with a success
++// payload shaped like FetchSuccess / McpSuccess: field 1 { content/text }.
++func EncodeExecUnknownSuccess(execMsgId uint32, execId string, fieldNumber int, content string) []byte {
++	if fieldNumber <= 0 {
++		fieldNumber = 28
++	}
++	success := protowire.AppendTag(nil, 1, protowire.BytesType)
++	success = protowire.AppendString(success, content) // url-or-unused
++	success = protowire.AppendTag(success, 2, protowire.BytesType)
++	success = protowire.AppendString(success, content) // content/text
++	success = protowire.AppendTag(success, 3, protowire.VarintType)
++	success = protowire.AppendVarint(success, 200) // status_code if Fetch-shaped
++
++	result := protowire.AppendTag(nil, 1, protowire.BytesType)
++	result = protowire.AppendBytes(result, success)
++	return encodeRawExecClientMsg(execMsgId, execId, fieldNumber, result)
++}
++
++func encodeRawExecClientMsg(execMsgId uint32, execId string, fieldNumber int, result []byte) []byte {
++	ecm := protowire.AppendTag(nil, ECM_Id, protowire.VarintType)
++	ecm = protowire.AppendVarint(ecm, uint64(execMsgId))
++	ecm = protowire.AppendTag(ecm, ECM_ExecId, protowire.BytesType)
++	ecm = protowire.AppendString(ecm, execId)
++	ecm = protowire.AppendTag(ecm, protowire.Number(fieldNumber), protowire.BytesType)
++	ecm = protowire.AppendBytes(ecm, result)
++
++	acm := protowire.AppendTag(nil, ACM_ExecClientMessage, protowire.BytesType)
++	acm = protowire.AppendBytes(acm, ecm)
++	return acm
++}
++
++// EncodeInteractionQueryApproved replies to ASM InteractionQuery (field 7) with
++// an approved InteractionResponse so Cursor can continue the built-in search.
++// queryKind mirrors InteractionQuery oneof field numbers (2=web_search, 5=exa_search, ...).
++func EncodeInteractionQueryApproved(queryID uint32, queryKind int) []byte {
++	if queryKind <= 0 {
++		queryKind = 2 // web_search_request_response
++	}
++	// InteractionResponse response oneof field numbers match query kinds:
++	// 2 web_search, 3 ask_question, 4 switch_mode, 5 exa_search, 6 exa_fetch, 7 create_plan, 8 setup_vm
++	approved := []byte{} // empty Approved message is valid for web/exa search
++	respOneof := protowire.AppendTag(nil, 1, protowire.BytesType) // approved = 1
++	respOneof = protowire.AppendBytes(respOneof, approved)
++
++	ir := protowire.AppendTag(nil, 1, protowire.VarintType) // id is uint32
++	ir = protowire.AppendVarint(ir, uint64(queryID))
++	ir = protowire.AppendTag(ir, protowire.Number(queryKind), protowire.BytesType)
++	ir = protowire.AppendBytes(ir, respOneof)
++
++	acm := protowire.AppendTag(nil, ACM_InteractionResponse, protowire.BytesType)
++	acm = protowire.AppendBytes(acm, ir)
++	return acm
++}
++
++// EncodeInteractionQueryRejected rejects an InteractionQuery so the model can
++// continue without the built-in tool.
++func EncodeInteractionQueryRejected(queryID uint32, queryKind int, reason string) []byte {
++	if queryKind <= 0 {
++		queryKind = 2
++	}
++	if reason == "" {
++		reason = "Tool not available in this environment."
++	}
++	rej := protowire.AppendTag(nil, 1, protowire.BytesType)
++	rej = protowire.AppendString(rej, reason)
++	respOneof := protowire.AppendTag(nil, 2, protowire.BytesType) // rejected = 2
++	respOneof = protowire.AppendBytes(respOneof, rej)
++
++	ir := protowire.AppendTag(nil, 1, protowire.VarintType)
++	ir = protowire.AppendVarint(ir, uint64(queryID))
++	ir = protowire.AppendTag(ir, protowire.Number(queryKind), protowire.BytesType)
++	ir = protowire.AppendBytes(ir, respOneof)
++
++	acm := protowire.AppendTag(nil, ACM_InteractionResponse, protowire.BytesType)
++	acm = protowire.AppendBytes(acm, ir)
++	return acm
++}
++
+ // encodeExecClientMsg wraps an exec result in AgentClientMessage.
+ // Mirrors sendExec() in cursor-fetch.ts.
+ func encodeExecClientMsg(id uint32, execId string, resultFieldName string, resultMsg *dynamicpb.Message) []byte {
+diff --git a/internal/auth/cursor/proto/fieldnumbers.go b/internal/auth/cursor/proto/fieldnumbers.go
+index 4b2accc6..2e718459 100644
+--- a/internal/auth/cursor/proto/fieldnumbers.go
++++ b/internal/auth/cursor/proto/fieldnumbers.go
+@@ -185,6 +185,14 @@ const (
+ 	ESM_BackgroundShellSpawn = 16 // BackgroundShellSpawnArgs
+ 	ESM_FetchArgs            = 20 // FetchArgs
+ 	ESM_WriteShellStdinArgs  = 23 // WriteShellStdinArgs
++	// Newer Cursor oneof members (may be absent from older embedded descriptors
++	// as named constants, but appear on the wire):
++	ESM_ListMcpResourcesArgs = 17 // ListMcpResourcesExecArgs
++	ESM_ReadMcpResourceArgs  = 18 // ReadMcpResourceExecArgs
++	ESM_SpanContext          = 19 // SpanContext (metadata — do not treat as tool)
++	ESM_RecordScreenArgs     = 21 // RecordScreenArgs
++	ESM_ComputerUseArgs      = 22 // ComputerUseArgs
++	// Field 28+ = built-in search / other tools not in older descriptors
+ )
+ 
+ // ExecClientMessage
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index eb1748fd..45503921 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -36,6 +36,10 @@ const (
+ 	cursorClientVersion     = "cli-2026.02.13-41ac335"
+ 	cursorAuthType          = "cursor"
+ 	cursorHeartbeatInterval = 5 * time.Second
++	// If Hermes never resumes with tool results (or IDs mismatch), do not hang forever.
++	cursorToolResultWaitTimeout = 90 * time.Second
++	// If Cursor stops sending frames mid-turn, fail the stream instead of hanging.
++	cursorStreamIdleTimeout = 120 * time.Second
+ 	cursorSessionTTL        = 5 * time.Minute
+ 	cursorCheckpointTTL     = 30 * time.Minute
+ )
+@@ -587,19 +591,23 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		toolCallIndex := 0
+ 		usage := &cursorTokenUsage{}
+ 		usage.setInputEstimate(len(payload))
++		// Emit an immediate role frame so OpenAI clients (Hermes) see a first
++		// SSE chunk before Cursor thinking starts. Without this, long silent
++		// prefill looks like a hung stream ("no chunks yet").
++		sendChunkSwitchable(`{"role":"assistant"}`, "")
+ 
+ 		streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
+ 			func(text string, isThinking bool) {
+ 				if isThinking {
+ 					if !thinkingActive {
+ 						thinkingActive = true
+-						sendChunkSwitchable(`{"role":"assistant","content":"<think>"}`, "")
++						sendChunkSwitchable(`{"role":"assistant","reasoning_content":`+jsonString(text)+`}`, "")
++					} else {
++						sendChunkSwitchable(fmt.Sprintf(`{"reasoning_content":%s}`, jsonString(text)), "")
+ 					}
+-					sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+ 				} else {
+ 					if thinkingActive {
+ 						thinkingActive = false
+-						sendChunkSwitchable(`{"content":"</think>"}`, "")
+ 					}
+ 					sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+ 				}
+@@ -607,10 +615,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 			func(exec pendingMcpExec) {
+ 				if thinkingActive {
+ 					thinkingActive = false
+-					sendChunkSwitchable(`{"content":"</think>"}`, "")
+ 				}
+-				toolCallJSON := fmt.Sprintf(`{"tool_calls":[{"index":%d,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]}`,
+-					toolCallIndex, exec.ToolCallId, exec.ToolName, jsonString(exec.Args))
++				// Cursor sometimes embeds newlines in tool call IDs (e.g. "call-...\nfc_...").
++				// Unescaped newlines break SSE JSON framing for OpenAI clients like Hermes.
++				toolCallID := sanitizeCursorToolCallID(exec.ToolCallId)
++				toolCallJSON := fmt.Sprintf(`{"tool_calls":[{"index":%d,"id":%s,"type":"function","function":{"name":%s,"arguments":%s}}]}`,
++					toolCallIndex, jsonString(toolCallID), jsonString(exec.ToolName), jsonString(exec.Args))
+ 				toolCallIndex++
+ 				sendChunkSwitchable(toolCallJSON, "")
+ 				sendChunkSwitchable(`{}`, `"tool_calls"`)
+@@ -674,12 +684,15 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 
+ 		// processH2SessionFrames returned — stream is done.
+ 		// Check if error happened before any chunks were emitted.
++		incomplete := false
+ 		if streamErr != nil {
+ 			select {
+ 			case <-firstChunkSent:
+-				// Chunks were already sent to client — can't transparently retry.
+-				// Next request will failover via conductor's cooldown mechanism.
+-				log.Warnf("cursor: stream error after data sent (auth=%s conv=%s): %v", authID, conversationId, streamErr)
++				// Partial SSE already delivered. Do NOT pretend the turn completed
++				// with finish_reason=stop — Hermes would accept a status sentence
++				// ("확인 중입니다") as the final answer.
++				log.Warnf("cursor: stream error after data sent (auth=%s conv=%s): %v — marking incomplete", authID, conversationId, streamErr)
++				incomplete = true
+ 			default:
+ 				// No data sent yet — propagate error for transparent conductor retry.
+ 				log.Warnf("cursor: stream error before data sent (auth=%s conv=%s): %v — signaling retry", authID, conversationId, streamErr)
+@@ -697,14 +710,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		}
+ 
+ 		if thinkingActive {
+-			sendChunkSwitchable(`{"content":"</think>"}`, "")
++			thinkingActive = false
+ 		}
+-		// Include token usage in the final stop chunk
+ 		inputTok, outputTok := usage.get()
+-		stopDelta := fmt.Sprintf(`{},"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}`,
+-			inputTok, outputTok, inputTok+outputTok)
+-		// Build the stop chunk with usage embedded in the choices array level
+ 		fr := `"stop"`
++		if incomplete {
++			// Prefer length so OpenAI clients treat the stream as truncated and
++			// Hermes can retry / continue instead of locking in a stub reply.
++			fr = `"length"`
++			note := "\n\n[stream interrupted before final answer]"
++			sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(note)), "")
++		}
+ 		openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
+ 			chatId, created, parsed.Model, fr, inputTok, outputTok, inputTok+outputTok)
+ 		sseLine := []byte("data: " + openaiJSON + "\n")
+@@ -717,7 +733,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
+ 		}
+ 		sendDoneSwitchable()
+-		_ = stopDelta // unused
+ 
+ 		// Close whatever output channel is still active
+ 		outMu.Lock()
+@@ -860,11 +875,34 @@ func processH2SessionFrames(
+ 	var buf bytes.Buffer
+ 	rejectReason := "Tool not available in this environment. Use the MCP tools provided instead."
+ 	log.Debugf("cursor: processH2SessionFrames started for streamID=%s, waiting for data...", stream.ID())
++	lastMeaningful := time.Now()
++	// While Cursor runs built-in web search after InteractionQuery approve, the
++	// server may send only heartbeats for several minutes. Use a longer idle
++	// budget in that window so we do not cut the turn after a status sentence.
++	searchIdleUntil := time.Time{}
++	idleTicker := time.NewTicker(5 * time.Second)
++	defer idleTicker.Stop()
++	resetIdle := func() {
++		lastMeaningful = time.Now()
++	}
++	markBuiltinSearchWait := func() {
++		resetIdle()
++		searchIdleUntil = time.Now().Add(4 * time.Minute)
++	}
+ 	for {
+ 		select {
+ 		case <-ctx.Done():
+ 			log.Debugf("cursor: processH2SessionFrames exiting: context done")
+ 			return ctx.Err()
++		case <-idleTicker.C:
++			idleLimit := cursorStreamIdleTimeout
++			if time.Now().Before(searchIdleUntil) {
++				idleLimit = 5 * time.Minute
++			}
++			if time.Since(lastMeaningful) >= idleLimit {
++				log.Warnf("cursor: stream idle for %s (streamID=%s) — ending hung session", idleLimit, stream.ID())
++				return fmt.Errorf("cursor: stream idle timeout after %s", idleLimit)
++			}
+ 		case data, ok := <-stream.Data():
+ 			if !ok {
+ 				log.Debugf("cursor: processH2SessionFrames[%s]: exiting: stream data channel closed", stream.ID())
+@@ -907,6 +945,9 @@ func processH2SessionFrames(
+ 				}
+ 
+ 				log.Debugf("cursor: decoded server message type=%d", msg.Type)
++				if msg.Type != cursorproto.ServerMsgHeartbeat {
++					resetIdle()
++				}
+ 				switch msg.Type {
+ 				case cursorproto.ServerMsgTextDelta:
+ 					if msg.Text != "" && onText != nil {
+@@ -924,7 +965,7 @@ func processH2SessionFrames(
+ 					return nil // clean completion
+ 
+ 				case cursorproto.ServerMsgHeartbeat:
+-					// Server heartbeat, ignore silently
++					// Server heartbeat must NOT reset idle — otherwise hung turns never time out.
+ 					continue
+ 
+ 				case cursorproto.ServerMsgCheckpoint:
+@@ -958,7 +999,7 @@ func processH2SessionFrames(
+ 				case cursorproto.ServerMsgExecMcpArgs:
+ 					if onMcpExec != nil {
+ 						decodedArgs := decodeMcpArgsToJSON(msg.McpArgs)
+-						toolCallId := msg.McpToolCallId
++						toolCallId := sanitizeCursorToolCallID(msg.McpToolCallId)
+ 						if toolCallId == "" {
+ 							toolCallId = uuid.New().String()
+ 						}
+@@ -978,15 +1019,25 @@ func processH2SessionFrames(
+ 						}
+ 
+ 						// Inline mode: wait for tool result while handling KV/heartbeat
+-						log.Debugf("cursor: waiting for tool result on channel (inline mode)...")
++						log.Infof("cursor: waiting for tool result on channel (tool=%s timeout=%s)...", pending.ToolName, cursorToolResultWaitTimeout)
+ 						var toolResults []toolResultInfo
++						toolTimedOut := false
++						toolWait := time.NewTimer(cursorToolResultWaitTimeout)
+ 					waitLoop:
+ 						for {
+ 							select {
+ 							case <-ctx.Done():
++								toolWait.Stop()
+ 								return ctx.Err()
++							case <-toolWait.C:
++								log.Warnf("cursor: timed out waiting for tool result tool=%s after %s — rejecting", pending.ToolName, cursorToolResultWaitTimeout)
++								resultBytes := cursorproto.EncodeExecMcpResult(pending.ExecMsgId, pending.ExecId, "Tool execution timed out waiting for client result.", true)
++								stream.Write(cursorproto.FrameConnectMessage(resultBytes, 0))
++								toolTimedOut = true
++								break waitLoop
+ 							case results, ok := <-toolResultCh:
+ 								if !ok {
++									toolWait.Stop()
+ 									return nil
+ 								}
+ 								toolResults = results
+@@ -1034,16 +1085,37 @@ func processH2SessionFrames(
+ 								return stream.Err()
+ 							}
+ 						}
++						toolWait.Stop()
++						if toolTimedOut {
++							continue // timeout already rejected above
++						}
+ 
+-						// Send MCP result
++						// Send MCP result. Match by tool_call_id, but if Hermes/Cursor
++						// IDs diverge (sanitization / multi-segment IDs), fall back to the
++						// single result — otherwise Cursor waits forever and Hermes hangs.
++						sent := false
+ 						for _, tr := range toolResults {
+-							if tr.ToolCallId == pending.ToolCallId {
+-								log.Debugf("cursor: sending inline MCP result for tool=%s", pending.ToolName)
++							if tr.ToolCallId == pending.ToolCallId || (len(toolResults) == 1 && !sent) {
++								if tr.ToolCallId != pending.ToolCallId {
++									log.Warnf("cursor: tool_call_id mismatch pending=%q got=%q — using sole result for tool=%s", pending.ToolCallId, tr.ToolCallId, pending.ToolName)
++								} else {
++									log.Infof("cursor: sending inline MCP result for tool=%s", pending.ToolName)
++								}
+ 								resultBytes := cursorproto.EncodeExecMcpResult(pending.ExecMsgId, pending.ExecId, tr.Content, false)
+ 								stream.Write(cursorproto.FrameConnectMessage(resultBytes, 0))
++								sent = true
+ 								break
+ 							}
+ 						}
++						if !sent {
++							ids := make([]string, 0, len(toolResults))
++							for _, tr := range toolResults {
++								ids = append(ids, tr.ToolCallId)
++							}
++							log.Warnf("cursor: no matching tool result for pending=%q got=%v — rejecting MCP exec", pending.ToolCallId, ids)
++							resultBytes := cursorproto.EncodeExecMcpResult(pending.ExecMsgId, pending.ExecId, "Tool result unavailable (id mismatch).", true)
++							stream.Write(cursorproto.FrameConnectMessage(resultBytes, 0))
++						}
+ 						continue
+ 					}
+ 
+@@ -1067,6 +1139,137 @@ func processH2SessionFrames(
+ 					stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeExecDiagnosticsResult(msg.ExecMsgId, msg.ExecId), 0))
+ 				case cursorproto.ServerMsgExecWriteShellStdin:
+ 					stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeExecWriteShellStdinError(msg.ExecMsgId, msg.ExecId, rejectReason), 0))
++				case cursorproto.ServerMsgInteractionQuery:
++					// Cursor built-in web/exa search asks the client to approve via
++					// InteractionResponse. Without a reply the stream hangs after
++					// "확인 중입니다". Auto-approve so the server can finish the search.
++					qid := msg.InteractionQueryID
++					qkind := msg.InteractionQueryKind
++					if qkind >= 2 && qkind <= 8 {
++						// web_search / ask_question / switch_mode / exa_* / create_plan / setup_vm
++						log.Infof("cursor: auto-approving InteractionQuery id=%d kind=%d term=%q", qid, qkind, msg.InteractionQueryTerm)
++						stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeInteractionQueryApproved(qid, qkind), 0))
++						markBuiltinSearchWait()
++					} else {
++						// kind 9+ is URL/fetch-style: empty Approved leaves Cursor waiting for
++						// client-fetched content and hangs the Hermes stream. Reject so the
++						// model continues (Hermes browser_* tools can fetch instead).
++						rejKind := qkind
++						if rejKind == 0 {
++							rejKind = 2
++						}
++						log.Warnf("cursor: rejecting InteractionQuery id=%d kind=%d (no client fetch) term=%q", qid, qkind, msg.InteractionQueryTerm)
++						stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeInteractionQueryRejected(qid, rejKind, rejectReason), 0))
++					}
++				case cursorproto.ServerMsgExecOther:
++					// Cursor built-in tools missing from the embedded descriptor
++					// (notably field 28 web/docs search). Must reply or the stream hangs.
++					fieldNum := msg.ExecFieldNumber
++					query, toolCallID := extractCursorBuiltinSearch(msg.ExecRawArgs)
++					if toolCallID == "" {
++						toolCallID = sanitizeCursorToolCallID(msg.McpToolCallId)
++					}
++					if toolCallID == "" {
++						toolCallID = uuid.New().String()
++					}
++					// When the OpenAI client registered tools, bridge built-in search
++					// into a normal web_search tool_call so Hermes can execute it.
++					// Without client tools, reject so the model continues from knowledge
++					// instead of hanging on an unanswered Cursor built-in exec.
++					if onMcpExec != nil && len(mcpTools) > 0 && fieldNum == 28 && query != "" {
++						argsJSON, _ := json.Marshal(map[string]string{"query": query})
++						log.Infof("cursor: bridging built-in search field=%d to web_search query=%q", fieldNum, query)
++						onMcpExec(pendingMcpExec{
++							ExecMsgId:  msg.ExecMsgId,
++							ExecId:     msg.ExecId,
++							ToolCallId: toolCallID,
++							ToolName:   "web_search",
++							Args:       string(argsJSON),
++						})
++						if toolResultCh == nil {
++							return nil
++						}
++						log.Infof("cursor: waiting for bridged web_search result (timeout=%s)...", cursorToolResultWaitTimeout)
++						var toolResults []toolResultInfo
++						bridgeTimedOut := false
++						bridgeWaitTimer := time.NewTimer(cursorToolResultWaitTimeout)
++					bridgeWait:
++						for {
++							select {
++							case <-ctx.Done():
++								bridgeWaitTimer.Stop()
++								return ctx.Err()
++							case <-bridgeWaitTimer.C:
++								log.Warnf("cursor: bridged web_search timed out after %s — rejecting", cursorToolResultWaitTimeout)
++								stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeExecUnknownRejected(msg.ExecMsgId, msg.ExecId, fieldNum, "bridged web_search timed out"), 0))
++								bridgeTimedOut = true
++								break bridgeWait
++							case results, ok := <-toolResultCh:
++								if !ok {
++									bridgeWaitTimer.Stop()
++									return nil
++								}
++								toolResults = results
++								break bridgeWait
++							case waitData, ok := <-stream.Data():
++								if !ok {
++									return stream.Err()
++								}
++								buf.Write(waitData)
++								for {
++									cb := buf.Bytes()
++									if len(cb) == 0 {
++										break
++									}
++									wf, wp, wc, wok := cursorproto.ParseConnectFrame(cb)
++									if !wok {
++										break
++									}
++									buf.Next(wc)
++									if wf&cursorproto.ConnectEndStreamFlag != 0 {
++										continue
++									}
++									wmsg, werr := cursorproto.DecodeAgentServerMessage(wp)
++									if werr != nil {
++										continue
++									}
++									switch wmsg.Type {
++									case cursorproto.ServerMsgKvGetBlob:
++										blobKey := cursorproto.BlobIdHex(wmsg.BlobId)
++										d := blobStore[blobKey]
++										stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeKvGetBlobResult(wmsg.KvId, d), 0))
++									case cursorproto.ServerMsgKvSetBlob:
++										blobKey := cursorproto.BlobIdHex(wmsg.BlobId)
++										blobStore[blobKey] = append([]byte(nil), wmsg.BlobData...)
++										stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeKvSetBlobResult(wmsg.KvId), 0))
++									case cursorproto.ServerMsgExecRequestCtx:
++										stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeExecRequestContextResult(wmsg.ExecMsgId, wmsg.ExecId, mcpTools), 0))
++									case cursorproto.ServerMsgCheckpoint:
++										if onCheckpoint != nil && len(wmsg.CheckpointData) > 0 {
++											onCheckpoint(wmsg.CheckpointData)
++										}
++									}
++								}
++							case <-stream.Done():
++								return stream.Err()
++							}
++						}
++						bridgeWaitTimer.Stop()
++						if bridgeTimedOut {
++							continue
++						}
++						for _, tr := range toolResults {
++							if tr.ToolCallId == toolCallID || len(toolResults) == 1 {
++								// Reply on the same unknown field number so Cursor accepts it.
++								stream.Write(cursorproto.FrameConnectMessage(
++									cursorproto.EncodeExecUnknownSuccess(msg.ExecMsgId, msg.ExecId, fieldNum, tr.Content), 0))
++								break
++							}
++						}
++						continue
++					}
++					log.Warnf("cursor: rejecting unknown exec field=%d execMsgId=%d (built-in tool not supported in proxy)", fieldNum, msg.ExecMsgId)
++					stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeExecUnknownRejected(msg.ExecMsgId, msg.ExecId, fieldNum, rejectReason), 0))
+ 				}
+ 			}
+ 
+@@ -1454,6 +1657,88 @@ func jsonString(s string) string {
+ 	return string(b)
+ }
+ 
++// sanitizeCursorToolCallID removes whitespace/newlines that Cursor sometimes
++// embeds in MCP tool call IDs. Those break OpenAI SSE JSON ("data: {...}")
++// because a raw newline terminates the SSE event mid-object.
++func sanitizeCursorToolCallID(id string) string {
++	if id == "" {
++		return id
++	}
++	// Prefer the last non-empty segment when Cursor concatenates IDs with \n.
++	parts := strings.FieldsFunc(id, func(r rune) bool {
++		return r == '\n' || r == '\r'
++	})
++	if len(parts) == 0 {
++		return strings.TrimSpace(id)
++	}
++	return strings.TrimSpace(parts[len(parts)-1])
++}
++
++// extractCursorBuiltinSearch pulls query + toolCallId from Cursor's undocumented
++// built-in search exec payload (field 28). Best-effort protobuf walk.
++func extractCursorBuiltinSearch(raw []byte) (query, toolCallID string) {
++	if len(raw) == 0 {
++		return "", ""
++	}
++	var walk func(data []byte, depth int)
++	walk = func(data []byte, depth int) {
++		for len(data) > 0 {
++			num, typ, n := consumeTag(data)
++			if n < 0 {
++				return
++			}
++			data = data[n:]
++			if typ != 2 { // BytesType
++				n = consumeFieldValue(num, typ, data)
++				if n < 0 {
++					return
++				}
++				data = data[n:]
++				continue
++			}
++			val, n := consumeBytes(data)
++			if n < 0 {
++				return
++			}
++			data = data[n:]
++			if isMostlyPrintable(val) {
++				s := string(val)
++				if toolCallID == "" && (strings.Contains(s, "call-") || strings.Contains(s, "fc_")) {
++					toolCallID = sanitizeCursorToolCallID(s)
++				} else if len(s) >= 8 && len(s) < 2000 && !strings.Contains(s, "\x00") {
++					// Prefer short title-like strings (field 1 under nested search args).
++					if !strings.Contains(s, "\n") || len(s) < 120 {
++						if query == "" || (len(s) < len(query) && !strings.Contains(s, "Please")) {
++							query = s
++						}
++					}
++					if strings.HasPrefix(s, "Cursor ") || strings.Contains(strings.ToLower(s), "usage") {
++						query = s
++					}
++				}
++			}
++			if depth < 5 {
++				walk(val, depth+1)
++			}
++		}
++	}
++	walk(raw, 0)
++	return query, toolCallID
++}
++
++func isMostlyPrintable(b []byte) bool {
++	if len(b) == 0 {
++		return false
++	}
++	printable := 0
++	for _, c := range b {
++		if c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c < 127) {
++			printable++
++		}
++	}
++	return printable*10 >= len(b)*8
++}
++
+ func decodeMcpArgsToJSON(args map[string][]byte) string {
+ 	if len(args) == 0 {
+ 		return "{}"

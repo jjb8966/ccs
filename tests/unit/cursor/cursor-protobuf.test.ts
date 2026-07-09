@@ -1294,6 +1294,25 @@ describe('CursorExecutor', () => {
       expect(bodyText).toContain(thinkingContent);
     });
 
+    it('should emit mid-thinking reasoning_content without waiting for </think>', async () => {
+      // Thinking payloads often arrive as many frames before any </think> text
+      // marker. SSE must keep flowing so OpenAI-compatible clients do not hit
+      // stream-stale timeouts (same contract as executeStreaming live path).
+      const part1 = 'step one of long reasoning';
+      const part2 = 'step two still before end marker';
+      const combined = Buffer.concat([buildThinkingFrame(part1), buildThinkingFrame(part2)]);
+
+      const result = executor.transformProtobufToSSE(combined, 'gpt-4', {
+        messages: [],
+      });
+
+      expect(result.status).toBe(200);
+      const bodyText = await result.text();
+      expect(bodyText).toContain(part1);
+      expect(bodyText).toContain(part2);
+      expect((bodyText.match(/reasoning_content/g) || []).length).toBeGreaterThanOrEqual(2);
+    });
+
     it('should emit tool call deltas and end with finish_reason tool_calls', async () => {
       const frame1 = buildToolCallFrame({
         id: 'call_abc',

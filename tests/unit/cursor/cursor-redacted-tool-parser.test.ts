@@ -121,6 +121,32 @@ generalPurpose
     }
   });
 
+  it('buffers until </think> and emits nothing mid-thinking (live SSE must bypass this)', () => {
+    // Legacy streams without <think> still buffer until </think>.
+    // Streams WITH <think> flush reasoning progressively (see next test).
+    const parser = new AssistantResponseStreamParser();
+    expect(parser.push('long internal reasoning without end marker yet')).toEqual([]);
+    expect(parser.push(' still more reasoning')).toEqual([]);
+  });
+
+  it('streams reasoning progressively after <think> without waiting for </think>', () => {
+    const parser = new AssistantResponseStreamParser();
+    const mid = parser.push('<think>step one of reasoning');
+    expect(mid.some((e) => e.kind === 'reasoning' && e.text.includes('step one'))).toBe(true);
+
+    const more = parser.push(' and step two');
+    expect(more.some((e) => e.kind === 'reasoning' && e.text.includes('step two'))).toBe(true);
+
+    const after = [
+      ...parser.push('</think>\nfinal answer'),
+      ...parser.finish(),
+    ];
+    expect(after.some((e) => e.kind === 'content' && e.text.includes('final answer'))).toBe(true);
+    expect(after.every((e) => e.kind !== 'content' || !String(e.text).includes('step one'))).toBe(
+      true
+    );
+  });
+
   it('extracts bracket-style tool_use text into tool calls', () => {
     const raw =
       '검색합니다.\n[tool_use Bash {"command":"mysql -e \\"show tables\\"","description":"list tables"}]';
